@@ -95,6 +95,46 @@ void OnTick()
 `ExampleStrategy_VWAP.mq5` ในโฟลเดอร์นี้เป็น EA ตัวอย่างเต็มรูปแบบที่ใช้
 กลยุทธ์ mean-reversion ตาม VWAP bands (ไว้เป็นโครงให้ต่อยอด)
 
+## VWAP + EMA Signal (ลูกศร No-Repaint)
+
+`VWAP_EMA_Signal.mq5` เป็น indicator สัญญาณลูกศรตามกลยุทธ์:
+
+**ตรรกะ**
+
+1. **เทรนด์** — EMA(9) เทียบกับ VWAP
+   - EMA9 อยู่ **เหนือ** VWAP = ขาขึ้น
+   - EMA9 อยู่ **ใต้** VWAP = ขาลง
+2. **Momentum** — ระยะห่าง EMA(5) − EMA(20)
+   - ยิ่งถ่างออกในทิศทางเทรนด์ = แรงยิ่งมาก
+   - ต้องห่างกันอย่างน้อย `InpMinSpreadPoints` (points) จึงยืนยัน
+   - เปิด `InpRequireExpanding` = ต้องกำลัง**ถ่างออก**เพิ่มขึ้นด้วย
+3. **สัญญาณ** — ยิงลูกศรเมื่อ **เทรนด์ + momentum ตรงกัน** (edge trigger ยิงครั้งเดียวตอนเริ่ม align)
+   - ลูกศรเขียวขึ้น = Buy, ลูกศรแดงลง = Sell
+
+**No-Repaint:** สัญญาณคำนวณจาก**แท่งที่ปิดแล้วเท่านั้น** (ข้ามแท่งกำลังวิ่ง)
+ค่าที่ใช้ (EMA/VWAP ของแท่งปิด) นิ่งแล้ว ลูกศรที่ขึ้นจึงไม่ย้ายและไม่หายไป
+
+**พารามิเตอร์สำคัญ**
+
+| พารามิเตอร์ | ค่าเริ่มต้น | ความหมาย |
+|---|---|---|
+| `InpEMAfast` / `InpEMAmid` / `InpEMAslow` | 5 / 9 / 20 | คาบ EMA |
+| `InpMinSpreadPoints` | 50 | ระยะห่าง EMA5-EMA20 ขั้นต่ำ (points) |
+| `InpRequireExpanding` | true | ต้องกำลังถ่างออกเพิ่ม |
+| `InpVwapAnchor` | 0 (Session) | จุดรีเซ็ต VWAP |
+| `InpArrowOffsetPoints` | 100 | ระยะลูกศรห่างจากแท่ง (points) |
+| `InpAlertPopup` / `InpAlertPush` | false | แจ้งเตือนป๊อปอัป / มือถือ |
+
+> **ต้องมี `VWAP.ex5` คอมไพล์ไว้ก่อน** เพราะตัวนี้ดึงค่า VWAP ผ่าน `iCustom`
+> วางทั้ง `VWAP.mq5` และ `VWAP_EMA_Signal.mq5` ใน `MQL5/Indicators/` แล้วคอมไพล์ทั้งคู่
+
+**Buffer สำหรับต่อยอดใน EA**
+
+| Index | Buffer |
+|---|---|
+| 0 | Buy arrow (มีค่า = มีสัญญาณ Buy ที่แท่งนั้น) |
+| 1 | Sell arrow |
+
 ## ข้อควรระวัง
 
 - VWAP เดิมออกแบบสำหรับตลาดที่มี volume จริง (หุ้น/ฟิวเจอร์ส) การใช้กับ
