@@ -110,7 +110,11 @@ void OnTick()
    - ยิ่งถ่างออกในทิศทางเทรนด์ = แรงยิ่งมาก
    - ต้องห่างกันอย่างน้อย `InpMinSpreadPoints` (points) จึงยืนยัน
    - เปิด `InpRequireExpanding` = ต้องกำลัง**ถ่างออก**เพิ่มขึ้นด้วย
-3. **สัญญาณ** — ยิงลูกศรเมื่อ **เทรนด์ + momentum ตรงกัน** (edge trigger ยิงครั้งเดียวตอนเริ่ม align)
+3. **Volatility gate** — ความกว้างของ Bollinger Band (เส้นบน − เส้นล่าง)
+   - เป็นตัวกรอง **volatility** ที่ทั้งสองชุดต้องผ่านร่วมกัน (ค่าเดียว ไม่มีทิศทาง)
+   - วัดเป็น **% ของเส้นกลาง** (BBW) → ต้องกว้างอย่างน้อย `InpMinBBWidthPct`
+   - เปิด `InpBBExpanding` = แบนด์ต้องกำลัง**ถ่างออก** (หลุด squeeze / volatility ระเบิด)
+4. **สัญญาณ** — ยิงลูกศรเมื่อ **เทรนด์ + momentum + volatility ครบ** (edge trigger ยิงครั้งเดียวตอนเริ่ม align)
    - ลูกศรเขียวขึ้น = Buy, ลูกศรแดงลง = Sell
 
 **No-Repaint:** สัญญาณคำนวณจาก**แท่งที่ปิดแล้วเท่านั้น** (ข้ามแท่งกำลังวิ่ง)
@@ -125,6 +129,9 @@ void OnTick()
 | `InpRequireExpanding` | true | EMA5-EMA20 ต้องกำลังถ่างออกเพิ่ม |
 | `InpMinVwapGapPoints` | 0 | ระยะห่าง EMA9-VWAP ขั้นต่ำ (0=ใช้แค่ทิศทาง) |
 | `InpVwapExpanding` | false | EMA9-VWAP ต้องกำลังถ่างออกเพิ่ม |
+| `InpBBPeriod` / `InpBBDev` | 20 / 2.0 | คาบ / ส่วนเบี่ยงเบน Bollinger Band |
+| `InpMinBBWidthPct` | 0 | ความกว้าง BB ขั้นต่ำ (% ของเส้นกลาง, 0=ปิด) |
+| `InpBBExpanding` | false | BB ต้องกำลังถ่างออก (volatility ขยาย) |
 | `InpVwapAnchor` | 0 (Session) | จุดรีเซ็ต VWAP |
 | `InpArrowOffsetPoints` | 100 | ระยะลูกศรห่างจากแท่ง (points) |
 | `InpAlertPopup` / `InpAlertPush` | false | แจ้งเตือนป๊อปอัป / มือถือ |

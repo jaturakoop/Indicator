@@ -28,6 +28,13 @@ grpTrend = "Trend strength (EMA9-VWAP gap)"
 minVwapGapTicks = input.float(0, "Min |EMA9-VWAP| (ticks, 0 = direction only)", minval = 0, group = grpTrend)
 vwapExpanding   = input.bool(false, "Require EMA9-VWAP gap to be widening", group = grpTrend)
 
+grpBB    = "Volatility (Bollinger Band width)"
+bbLen        = input.int(20, "BB period", minval = 1, group = grpBB)
+bbDev        = input.float(2.0, "BB deviations", minval = 0.1, group = grpBB)
+bbSrc        = input.source(close, "BB source", group = grpBB)
+minBBWidthPct = input.float(0, "Min band width as % of basis (0 = off)", minval = 0, group = grpBB)
+bbExpanding   = input.bool(false, "Require band width to be widening", group = grpBB)
+
 grpVWAP  = "VWAP"
 vwapSrc  = input.source(hlc3, "VWAP source", group = grpVWAP)
 vwapAnchor = input.string("Session", "VWAP anchor", options = ["Session", "Week", "Month"], group = grpVWAP)
@@ -48,13 +55,21 @@ newPeriod = switch vwapAnchor
     => timeframe.change("D")               // Session (daily)
 vwapValue = ta.vwap(vwapSrc, newPeriod)
 
+// Bollinger Bands (volatility gate shared by both sets)
+bbBasis = ta.sma(bbSrc, bbLen)
+bbDevAbs = bbDev * ta.stdev(bbSrc, bbLen)
+bbUpper = bbBasis + bbDevAbs
+bbLower = bbBasis - bbDevAbs
+bbWidth = bbUpper - bbLower
+bbWidthPct = bbBasis != 0 ? bbWidth / math.abs(bbBasis) * 100 : 0.0
+
 minGap  = minSpreadTicks * syminfo.mintick
 minVGap = minVwapGapTicks * syminfo.mintick
 spread  = emaFast - emaSlow                 // EMA5 - EMA20
 vgap    = emaMid - vwapValue                // EMA9 - VWAP
 
 // Directional state per bar: +1 bull aligned, -1 bear aligned, 0 none
-f_state(_spread, _spreadPrev, _vgap, _vgapPrev) =>
+f_state(_spread, _spreadPrev, _vgap, _vgapPrev, _bbwPct, _bbwidth, _bbwidthPrev) =>
     // Trend strength from EMA9-VWAP gap magnitude
     trendUp   = _vgap >  minVGap
     trendDown = _vgap < -minVGap
@@ -67,10 +82,14 @@ f_state(_spread, _spreadPrev, _vgap, _vgapPrev) =>
     if requireExpanding
         momUp   := momUp   and _spread > _spreadPrev
         momDown := momDown and _spread < _spreadPrev
-    trendUp and momUp ? 1 : trendDown and momDown ? -1 : 0
+    // Volatility gate from Bollinger Band width
+    volOk = _bbwPct >= minBBWidthPct
+    if bbExpanding and volOk
+        volOk := _bbwidth > _bbwidthPrev
+    not volOk ? 0 : trendUp and momUp ? 1 : trendDown and momDown ? -1 : 0
 
-state     = f_state(spread,    spread[1], vgap,    vgap[1])
-statePrev = f_state(spread[1], spread[2], vgap[1], vgap[2])
+state     = f_state(spread,    spread[1], vgap,    vgap[1], bbWidthPct,    bbWidth,    bbWidth[1])
+statePrev = f_state(spread[1], spread[2], vgap[1], vgap[2], bbWidthPct[1], bbWidth[1], bbWidth[2])
 
 // Edge trigger: alignment appears for the first time
 buyRaw  = state ==  1 and statePrev !=  1
@@ -85,6 +104,10 @@ plot(showEMAs ? emaFast : na, "EMA Fast", color = color.new(color.aqua, 0),   li
 plot(showEMAs ? emaMid  : na, "EMA Mid",  color = color.new(color.yellow, 0), linewidth = 2)
 plot(showEMAs ? emaSlow : na, "EMA Slow", color = color.new(color.orange, 0), linewidth = 1)
 plot(showEMAs ? vwapValue : na, "VWAP",   color = color.new(color.fuchsia, 0), linewidth = 2)
+
+pUp = plot(showEMAs ? bbUpper : na, "BB Upper", color = color.new(color.gray, 30))
+pLo = plot(showEMAs ? bbLower : na, "BB Lower", color = color.new(color.gray, 30))
+fill(pUp, pLo, color = showEMAs ? color.new(color.gray, 92) : na, title = "BB fill")
 
 plotshape(buySignal,  title = "Buy",  style = shape.triangleup,   location = location.belowbar,
      color = color.lime, size = size.small, offset = -1)

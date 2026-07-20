@@ -47,6 +47,13 @@ input group "=== Trend strength (EMA9-VWAP gap) ==="
 input double InpMinVwapGapPoints = 0.0;  // Min |EMA9-VWAP| in points (0 = direction only)
 input bool   InpVwapExpanding    = false; // Require EMA9-VWAP gap to be widening
 
+input group "=== Volatility (Bollinger Band width) ==="
+input int    InpBBPeriod    = 20;  // Bollinger Band period
+input double InpBBDev       = 2.0; // Bollinger Band deviations
+input ENUM_APPLIED_PRICE InpBBPrice = PRICE_CLOSE; // BB applied price
+input double InpMinBBWidthPct = 0.0; // Min band width as % of basis (0 = off)
+input bool   InpBBExpanding    = false; // Require band width to be widening
+
 input group "=== VWAP (via iCustom to VWAP.ex5) ==="
 input int    InpVwapAnchor  = 0;  // 0=Session 1=Week 2=Month 3=Continuous
 input int    InpVwapPrice   = 0;  // 0=Typical 1=Close 2=HLC 3=OHLC
@@ -69,9 +76,11 @@ int h_ema_fast = INVALID_HANDLE;
 int h_ema_mid  = INVALID_HANDLE;
 int h_ema_slow = INVALID_HANDLE;
 int h_vwap     = INVALID_HANDLE;
+int h_bb       = INVALID_HANDLE;
 
 //--- Local copies (non-series: index 0 = oldest)
 double EMAf[], EMAm[], EMAs[], VWAP[];
+double BBup[], BBlo[], BBmid[];
 
 //+------------------------------------------------------------------+
 //| Init                                                             |
@@ -101,8 +110,12 @@ int OnInit()
                     1.0,
                     2.0);
 
+//--- Bollinger Bands handle (volatility filter)
+   h_bb = iBands(_Symbol, _Period, InpBBPeriod, 0, InpBBDev, InpBBPrice);
+
    if(h_ema_fast == INVALID_HANDLE || h_ema_mid == INVALID_HANDLE ||
-      h_ema_slow == INVALID_HANDLE || h_vwap == INVALID_HANDLE)
+      h_ema_slow == INVALID_HANDLE || h_vwap == INVALID_HANDLE ||
+      h_bb == INVALID_HANDLE)
      {
       Print("VWAP_EMA_Signal: failed to create a handle. Ensure VWAP.ex5 is compiled in MQL5/Indicators.");
       return(INIT_FAILED);
@@ -113,6 +126,9 @@ int OnInit()
    ArraySetAsSeries(EMAm, false);
    ArraySetAsSeries(EMAs, false);
    ArraySetAsSeries(VWAP, false);
+   ArraySetAsSeries(BBup,  false);
+   ArraySetAsSeries(BBlo,  false);
+   ArraySetAsSeries(BBmid, false);
 
    IndicatorSetString(INDICATOR_SHORTNAME, "VWAP+EMA Signal");
    return(INIT_SUCCEEDED);
@@ -127,6 +143,7 @@ void OnDeinit(const int reason)
    if(h_ema_mid  != INVALID_HANDLE) IndicatorRelease(h_ema_mid);
    if(h_ema_slow != INVALID_HANDLE) IndicatorRelease(h_ema_slow);
    if(h_vwap     != INVALID_HANDLE) IndicatorRelease(h_vwap);
+   if(h_bb       != INVALID_HANDLE) IndicatorRelease(h_bb);
   }
 
 //+------------------------------------------------------------------+
@@ -167,6 +184,16 @@ int BarState(const int i)
       if(mom_down && !(spread < spread_prev)) mom_down = false;
      }
 
+//--- Volatility gate from Bollinger Band width (shared by both sets)
+   double bbwidth      = BBup[i] - BBlo[i];
+   double bbwidth_prev = (i > 0) ? BBup[i-1] - BBlo[i-1] : bbwidth;
+   double bbw_pct      = (BBmid[i] != 0.0) ? bbwidth / MathAbs(BBmid[i]) * 100.0 : 0.0;
+   bool vol_ok = (bbw_pct >= InpMinBBWidthPct);
+   if(InpBBExpanding && vol_ok)
+      vol_ok = (bbwidth > bbwidth_prev);
+   if(!vol_ok)
+      return(0);
+
    if(trend_up   && mom_up)   return(+1);
    if(trend_down && mom_down) return(-1);
    return(0);
@@ -186,15 +213,18 @@ int OnCalculate(const int rates_total,
                 const long &volume[],
                 const int &spread[])
   {
-   int min_bars = MathMax(InpEMAslow, InpEMAmid) + 2;
+   int min_bars = MathMax(MathMax(InpEMAslow, InpEMAmid), InpBBPeriod) + 2;
    if(rates_total < min_bars)
       return(0);
 
 //--- Pull finalised values for the whole series (index 0 = oldest)
-   if(CopyBuffer(h_ema_fast, 0, 0, rates_total, EMAf) < rates_total) return(prev_calculated);
-   if(CopyBuffer(h_ema_mid,  0, 0, rates_total, EMAm) < rates_total) return(prev_calculated);
-   if(CopyBuffer(h_ema_slow, 0, 0, rates_total, EMAs) < rates_total) return(prev_calculated);
-   if(CopyBuffer(h_vwap,     0, 0, rates_total, VWAP) < rates_total) return(prev_calculated);
+   if(CopyBuffer(h_ema_fast, 0, 0, rates_total, EMAf)  < rates_total) return(prev_calculated);
+   if(CopyBuffer(h_ema_mid,  0, 0, rates_total, EMAm)  < rates_total) return(prev_calculated);
+   if(CopyBuffer(h_ema_slow, 0, 0, rates_total, EMAs)  < rates_total) return(prev_calculated);
+   if(CopyBuffer(h_vwap,     0, 0, rates_total, VWAP)  < rates_total) return(prev_calculated);
+   if(CopyBuffer(h_bb, BASE_LINE,  0, rates_total, BBmid) < rates_total) return(prev_calculated);
+   if(CopyBuffer(h_bb, UPPER_BAND, 0, rates_total, BBup)  < rates_total) return(prev_calculated);
+   if(CopyBuffer(h_bb, LOWER_BAND, 0, rates_total, BBlo)  < rates_total) return(prev_calculated);
 
    double offset = InpArrowOffsetPoints * _Point;
 
