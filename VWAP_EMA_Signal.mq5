@@ -51,8 +51,9 @@ input group "=== Volatility (Bollinger Band width) ==="
 input int    InpBBPeriod    = 20;  // Bollinger Band period
 input double InpBBDev       = 2.0; // Bollinger Band deviations
 input ENUM_APPLIED_PRICE InpBBPrice = PRICE_CLOSE; // BB applied price
-input double InpMinBBWidthPct = 0.0; // Min band width as % of basis (0 = off)
-input bool   InpBBExpanding    = false; // Require band width to be widening
+input bool   InpBBExpanding    = true; // Require upper/lower band to be spreading apart
+input int    InpBBExpandLookback = 1;  // Expansion lookback (bars): width now > width N bars ago
+input double InpMinBBWidthPct = 0.0; // Extra: min band width as % of basis (0 = off)
 
 input group "=== VWAP (via iCustom to VWAP.ex5) ==="
 input int    InpVwapAnchor  = 0;  // 0=Session 1=Week 2=Month 3=Continuous
@@ -184,13 +185,20 @@ int BarState(const int i)
       if(mom_down && !(spread < spread_prev)) mom_down = false;
      }
 
-//--- Volatility gate from Bollinger Band width (shared by both sets)
-   double bbwidth      = BBup[i] - BBlo[i];
-   double bbwidth_prev = (i > 0) ? BBup[i-1] - BBlo[i-1] : bbwidth;
-   double bbw_pct      = (BBmid[i] != 0.0) ? bbwidth / MathAbs(BBmid[i]) * 100.0 : 0.0;
-   bool vol_ok = (bbw_pct >= InpMinBBWidthPct);
-   if(InpBBExpanding && vol_ok)
-      vol_ok = (bbwidth > bbwidth_prev);
+//--- Volatility gate: upper/lower Bollinger bands must be spreading apart.
+//--- Only the raw distance (upper - lower) matters; the basis is ignored.
+   double bbwidth = BBup[i] - BBlo[i];
+   int    lb      = (InpBBExpandLookback < 1) ? 1 : InpBBExpandLookback;
+   double bbwidth_ref = (i >= lb) ? BBup[i-lb] - BBlo[i-lb] : bbwidth;
+
+   bool vol_ok = true;
+   if(InpBBExpanding)
+      vol_ok = (bbwidth > bbwidth_ref);            // bands widening = volatility in
+   if(vol_ok && InpMinBBWidthPct > 0.0)            // optional extra width floor
+     {
+      double bbw_pct = (BBmid[i] != 0.0) ? bbwidth / MathAbs(BBmid[i]) * 100.0 : 0.0;
+      vol_ok = (bbw_pct >= InpMinBBWidthPct);
+     }
    if(!vol_ok)
       return(0);
 

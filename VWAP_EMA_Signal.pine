@@ -32,8 +32,9 @@ grpBB    = "Volatility (Bollinger Band width)"
 bbLen        = input.int(20, "BB period", minval = 1, group = grpBB)
 bbDev        = input.float(2.0, "BB deviations", minval = 0.1, group = grpBB)
 bbSrc        = input.source(close, "BB source", group = grpBB)
-minBBWidthPct = input.float(0, "Min band width as % of basis (0 = off)", minval = 0, group = grpBB)
-bbExpanding   = input.bool(false, "Require band width to be widening", group = grpBB)
+bbExpanding      = input.bool(true, "Require upper/lower band to be spreading apart", group = grpBB)
+bbExpandLookback = input.int(1, "Expansion lookback (bars)", minval = 1, group = grpBB)
+minBBWidthPct    = input.float(0, "Extra: min width as % of basis (0 = off)", minval = 0, group = grpBB)
 
 grpVWAP  = "VWAP"
 vwapSrc  = input.source(hlc3, "VWAP source", group = grpVWAP)
@@ -55,13 +56,18 @@ newPeriod = switch vwapAnchor
     => timeframe.change("D")               // Session (daily)
 vwapValue = ta.vwap(vwapSrc, newPeriod)
 
-// Bollinger Bands (volatility gate shared by both sets)
+// Bollinger Bands — only the upper/lower distance matters (basis ignored)
 bbBasis = ta.sma(bbSrc, bbLen)
 bbDevAbs = bbDev * ta.stdev(bbSrc, bbLen)
 bbUpper = bbBasis + bbDevAbs
 bbLower = bbBasis - bbDevAbs
-bbWidth = bbUpper - bbLower
+bbWidth = bbUpper - bbLower                  // distance between upper & lower
 bbWidthPct = bbBasis != 0 ? bbWidth / math.abs(bbBasis) * 100 : 0.0
+
+// Volatility gate: bands spreading apart (widening) = volatility / volume in.
+volExpandOk = not bbExpanding or (bbWidth > bbWidth[bbExpandLookback])
+volFloorOk  = minBBWidthPct <= 0 or (bbWidthPct >= minBBWidthPct)
+volOk = volExpandOk and volFloorOk
 
 minGap  = minSpreadTicks * syminfo.mintick
 minVGap = minVwapGapTicks * syminfo.mintick
@@ -69,7 +75,7 @@ spread  = emaFast - emaSlow                 // EMA5 - EMA20
 vgap    = emaMid - vwapValue                // EMA9 - VWAP
 
 // Directional state per bar: +1 bull aligned, -1 bear aligned, 0 none
-f_state(_spread, _spreadPrev, _vgap, _vgapPrev, _bbwPct, _bbwidth, _bbwidthPrev) =>
+f_state(_spread, _spreadPrev, _vgap, _vgapPrev, _volOk) =>
     // Trend strength from EMA9-VWAP gap magnitude
     trendUp   = _vgap >  minVGap
     trendDown = _vgap < -minVGap
@@ -82,14 +88,11 @@ f_state(_spread, _spreadPrev, _vgap, _vgapPrev, _bbwPct, _bbwidth, _bbwidthPrev)
     if requireExpanding
         momUp   := momUp   and _spread > _spreadPrev
         momDown := momDown and _spread < _spreadPrev
-    // Volatility gate from Bollinger Band width
-    volOk = _bbwPct >= minBBWidthPct
-    if bbExpanding and volOk
-        volOk := _bbwidth > _bbwidthPrev
-    not volOk ? 0 : trendUp and momUp ? 1 : trendDown and momDown ? -1 : 0
+    // Volatility gate (Bollinger bands widening) must also pass
+    not _volOk ? 0 : trendUp and momUp ? 1 : trendDown and momDown ? -1 : 0
 
-state     = f_state(spread,    spread[1], vgap,    vgap[1], bbWidthPct,    bbWidth,    bbWidth[1])
-statePrev = f_state(spread[1], spread[2], vgap[1], vgap[2], bbWidthPct[1], bbWidth[1], bbWidth[2])
+state     = f_state(spread,    spread[1], vgap,    vgap[1], volOk)
+statePrev = f_state(spread[1], spread[2], vgap[1], vgap[2], volOk[1])
 
 // Edge trigger: alignment appears for the first time
 buyRaw  = state ==  1 and statePrev !=  1
