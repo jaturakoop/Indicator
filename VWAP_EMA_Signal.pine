@@ -1,0 +1,90 @@
+// © Indicator
+//@version=5
+// =====================================================================
+//  VWAP + EMA(9) trend, EMA(5)/EMA(20) momentum — No-Repaint arrows
+// ---------------------------------------------------------------------
+//  Strategy logic (mirror of the MT5 VWAP_EMA_Signal indicator)
+//    * Trend    : EMA(9) vs VWAP        (EMA9 > VWAP = bullish)
+//    * Momentum : EMA(5) - EMA(20) gap  (wider/expanding = stronger)
+//    * Signal   : arrow when trend + momentum align (edge trigger)
+//
+//  No-Repaint: signals are evaluated on the previous CLOSED bar and
+//  drawn with offset = -1, so a printed arrow never moves or vanishes.
+// =====================================================================
+indicator("VWAP + EMA Signal", overlay = true, max_labels_count = 500)
+
+// ------------------------- Inputs ------------------------------------
+grpEMA   = "EMA settings"
+emaFastLen = input.int(5,  "Fast EMA (momentum)", minval = 1, group = grpEMA)
+emaMidLen  = input.int(9,  "Mid EMA (trend, w/ VWAP)", minval = 1, group = grpEMA)
+emaSlowLen = input.int(20, "Slow EMA (momentum)", minval = 1, group = grpEMA)
+emaSrc     = input.source(close, "EMA source", group = grpEMA)
+
+grpMom   = "Momentum (EMA5-EMA20 spread)"
+minSpreadTicks   = input.float(50, "Min |EMA5-EMA20| (ticks)", minval = 0, group = grpMom)
+requireExpanding = input.bool(true, "Require spread to be widening", group = grpMom)
+
+grpVWAP  = "VWAP"
+vwapSrc  = input.source(hlc3, "VWAP source", group = grpVWAP)
+vwapAnchor = input.string("Session", "VWAP anchor", options = ["Session", "Week", "Month"], group = grpVWAP)
+
+grpDisp  = "Display"
+showEMAs   = input.bool(true, "Plot EMAs & VWAP", group = grpDisp)
+colorTrend = input.bool(true, "Color background by trend", group = grpDisp)
+
+// ------------------------- Calculations ------------------------------
+emaFast = ta.ema(emaSrc, emaFastLen)
+emaMid  = ta.ema(emaSrc, emaMidLen)
+emaSlow = ta.ema(emaSrc, emaSlowLen)
+
+// Anchored VWAP: reset at the chosen period boundary
+newPeriod = switch vwapAnchor
+    "Week"  => timeframe.change("W")
+    "Month" => timeframe.change("M")
+    => timeframe.change("D")               // Session (daily)
+vwapValue = ta.vwap(vwapSrc, newPeriod)
+
+minGap = minSpreadTicks * syminfo.mintick
+spread = emaFast - emaSlow                  // EMA5 - EMA20
+
+// Directional state per bar: +1 bull aligned, -1 bear aligned, 0 none
+f_state(_emaMid, _vwap, _spread, _spreadPrev) =>
+    trendUp   = _emaMid > _vwap
+    trendDown = _emaMid < _vwap
+    momUp   = _spread >  minGap
+    momDown = _spread < -minGap
+    if requireExpanding
+        momUp   := momUp   and _spread > _spreadPrev
+        momDown := momDown and _spread < _spreadPrev
+    trendUp and momUp ? 1 : trendDown and momDown ? -1 : 0
+
+state     = f_state(emaMid,    vwapValue,    spread,    spread[1])
+statePrev = f_state(emaMid[1], vwapValue[1], spread[1], spread[2])
+
+// Edge trigger: alignment appears for the first time
+buyRaw  = state ==  1 and statePrev !=  1
+sellRaw = state == -1 and statePrev != -1
+
+// ---- No-Repaint: evaluate on the closed bar, draw with offset = -1 ----
+buySignal  = buyRaw[1]
+sellSignal = sellRaw[1]
+
+// ------------------------- Plots -------------------------------------
+plot(showEMAs ? emaFast : na, "EMA Fast", color = color.new(color.aqua, 0),   linewidth = 1)
+plot(showEMAs ? emaMid  : na, "EMA Mid",  color = color.new(color.yellow, 0), linewidth = 2)
+plot(showEMAs ? emaSlow : na, "EMA Slow", color = color.new(color.orange, 0), linewidth = 1)
+plot(showEMAs ? vwapValue : na, "VWAP",   color = color.new(color.fuchsia, 0), linewidth = 2)
+
+plotshape(buySignal,  title = "Buy",  style = shape.triangleup,   location = location.belowbar,
+     color = color.lime, size = size.small, offset = -1)
+plotshape(sellSignal, title = "Sell", style = shape.triangledown, location = location.abovebar,
+     color = color.red,  size = size.small, offset = -1)
+
+// Trend background (based on closed-bar trend to stay non-repainting)
+trendUpBar   = (emaMid > vwapValue)[1]
+trendDownBar = (emaMid < vwapValue)[1]
+bgcolor(colorTrend ? (trendUpBar ? color.new(color.green, 92) : trendDownBar ? color.new(color.red, 92) : na) : na)
+
+// ------------------------- Alerts ------------------------------------
+alertcondition(buySignal,  "VWAP+EMA Buy",  "Buy: EMA9>VWAP & EMA5/20 momentum aligned")
+alertcondition(sellSignal, "VWAP+EMA Sell", "Sell: EMA9<VWAP & EMA5/20 momentum aligned")

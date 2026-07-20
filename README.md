@@ -135,6 +135,35 @@ void OnTick()
 | 0 | Buy arrow (มีค่า = มีสัญญาณ Buy ที่แท่งนั้น) |
 | 1 | Sell arrow |
 
+## เวอร์ชัน TradingView (Pine Script)
+
+`VWAP_EMA_Signal.pine` คือกลยุทธ์เดียวกันในเวอร์ชัน **Pine Script v5**
+สำหรับ TradingView — ตรรกะเหมือน MT5 ทุกอย่าง (EMA9 vs VWAP + EMA5/20 spread + ลูกศร No-Repaint)
+
+**วิธีติดตั้ง**
+
+1. เปิด TradingView → เมนูล่าง **Pine Editor**
+2. ลบโค้ดตัวอย่าง แล้ววางเนื้อหาจาก `VWAP_EMA_Signal.pine`
+3. กด **Save** → **Add to chart**
+4. ตั้ง Alert ได้จากเงื่อนไข "VWAP+EMA Buy" / "VWAP+EMA Sell"
+
+**No-Repaint ใน Pine ทำยังไง**
+
+- สัญญาณคำนวณจาก**แท่งที่ปิดแล้ว** (`buyRaw[1]`) แล้ววาดด้วย `offset = -1`
+- ลูกศรจึงปรากฏบนแท่งที่ทริกเกอร์จริง และ**ไม่ขยับ/ไม่หาย**เมื่อแท่งปัจจุบันวิ่ง
+- Background เทรนด์ก็อิงแท่งปิด (`[1]`) เช่นกัน
+
+**ต่างจาก MT5 เล็กน้อย**
+
+| หัวข้อ | MT5 | TradingView |
+|---|---|---|
+| ระยะ spread | points (`InpMinSpreadPoints`) | ticks (`minSpreadTicks`) |
+| VWAP anchor | Session/Week/Month/Continuous | Session/Week/Month |
+| VWAP volume | tick / real เลือกได้ | ใช้ volume ของ TradingView |
+
+> TradingView ใช้ built-in `ta.vwap` ซึ่งอิง volume ของแพลตฟอร์มเอง
+> ผลลัพธ์อาจต่างจาก MT5 (ที่ใช้ tick volume ของโบรก) เล็กน้อยตามธรรมชาติของข้อมูล
+
 ## ข้อควรระวัง
 
 - VWAP เดิมออกแบบสำหรับตลาดที่มี volume จริง (หุ้น/ฟิวเจอร์ส) การใช้กับ
