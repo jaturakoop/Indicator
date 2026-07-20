@@ -43,6 +43,10 @@ input group "=== Momentum (EMA5-EMA20 spread) ==="
 input double InpMinSpreadPoints = 50.0; // Min |EMA5-EMA20| in points to confirm
 input bool   InpRequireExpanding = true; // Require spread to be widening
 
+input group "=== Trend strength (EMA9-VWAP gap) ==="
+input double InpMinVwapGapPoints = 0.0;  // Min |EMA9-VWAP| in points (0 = direction only)
+input bool   InpVwapExpanding    = false; // Require EMA9-VWAP gap to be widening
+
 input group "=== VWAP (via iCustom to VWAP.ex5) ==="
 input int    InpVwapAnchor  = 0;  // 0=Session 1=Week 2=Month 3=Continuous
 input int    InpVwapPrice   = 0;  // 0=Typical 1=Close 2=HLC 3=OHLC
@@ -136,9 +140,21 @@ int BarState(const int i)
    double spread_prev = (i > 0) ? EMAf[i-1] - EMAs[i-1] : spread;
    double min_gap = InpMinSpreadPoints * point;
 
-//--- Trend from EMA(9) vs VWAP
-   bool trend_up   = (EMAm[i] > VWAP[i]);
-   bool trend_down = (EMAm[i] < VWAP[i]);
+//--- Trend strength from EMA(9) vs VWAP (magnitude, not just side)
+   double vgap = EMAm[i] - VWAP[i];                // EMA9 - VWAP
+   double vgap_prev = (i > 0) ? EMAm[i-1] - VWAP[i-1] : vgap;
+   double min_vgap = InpMinVwapGapPoints * point;
+
+//--- Trend from EMA(9) vs VWAP: require a minimum separation
+   bool trend_up   = (vgap >  min_vgap);
+   bool trend_down = (vgap < -min_vgap);
+
+//--- Optional: require the EMA9-VWAP gap to be widening (trend accelerating)
+   if(InpVwapExpanding)
+     {
+      if(trend_up   && !(vgap > vgap_prev)) trend_up   = false;
+      if(trend_down && !(vgap < vgap_prev)) trend_down = false;
+     }
 
 //--- Momentum from EMA5/EMA20 separation
    bool mom_up   = (spread >  min_gap);

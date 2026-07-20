@@ -101,9 +101,11 @@ void OnTick()
 
 **ตรรกะ**
 
-1. **เทรนด์** — EMA(9) เทียบกับ VWAP
-   - EMA9 อยู่ **เหนือ** VWAP = ขาขึ้น
-   - EMA9 อยู่ **ใต้** VWAP = ขาลง
+1. **เทรนด์ + ความแรงของเทรนด์** — ระยะห่าง EMA(9) กับ VWAP
+   - EMA9 อยู่ **เหนือ** VWAP = ขาขึ้น / **ใต้** = ขาลง
+   - นำ**ขนาดของระยะห่าง** `EMA9 − VWAP` มาใช้ด้วย: ต้องห่างอย่างน้อย
+     `InpMinVwapGapPoints` (ตั้ง 0 = ใช้แค่ทิศทางเหมือนเดิม)
+   - เปิด `InpVwapExpanding` = ต้องกำลังถ่างออกเพิ่ม (เทรนด์กำลังเร่ง)
 2. **Momentum** — ระยะห่าง EMA(5) − EMA(20)
    - ยิ่งถ่างออกในทิศทางเทรนด์ = แรงยิ่งมาก
    - ต้องห่างกันอย่างน้อย `InpMinSpreadPoints` (points) จึงยืนยัน
@@ -120,7 +122,9 @@ void OnTick()
 |---|---|---|
 | `InpEMAfast` / `InpEMAmid` / `InpEMAslow` | 5 / 9 / 20 | คาบ EMA |
 | `InpMinSpreadPoints` | 50 | ระยะห่าง EMA5-EMA20 ขั้นต่ำ (points) |
-| `InpRequireExpanding` | true | ต้องกำลังถ่างออกเพิ่ม |
+| `InpRequireExpanding` | true | EMA5-EMA20 ต้องกำลังถ่างออกเพิ่ม |
+| `InpMinVwapGapPoints` | 0 | ระยะห่าง EMA9-VWAP ขั้นต่ำ (0=ใช้แค่ทิศทาง) |
+| `InpVwapExpanding` | false | EMA9-VWAP ต้องกำลังถ่างออกเพิ่ม |
 | `InpVwapAnchor` | 0 (Session) | จุดรีเซ็ต VWAP |
 | `InpArrowOffsetPoints` | 100 | ระยะลูกศรห่างจากแท่ง (points) |
 | `InpAlertPopup` / `InpAlertPush` | false | แจ้งเตือนป๊อปอัป / มือถือ |
