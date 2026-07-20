@@ -177,6 +177,91 @@ void OnTick()
 > TradingView ใช้ built-in `ta.vwap` ซึ่งอิง volume ของแพลตฟอร์มเอง
 > ผลลัพธ์อาจต่างจาก MT5 (ที่ใช้ tick volume ของโบรก) เล็กน้อยตามธรรมชาติของข้อมูล
 
+## Wyckoff Signal (Spring / Upthrust) — MT5 + TradingView
+
+`Wyckoff_Signal.mq5` และ `Wyckoff_Signal.pine` แปลงหลักการ Wyckoff เป็น
+สัญญาณ Buy/Sell แบบ No-Repaint โดยเลือกเฉพาะเหตุการณ์ที่ **นิยามเป็นกฎได้ชัด**
+และเทรดได้จริง
+
+**ตรรกะ**
+
+1. **Trading Range** — หา high สูงสุด / low ต่ำสุดจาก **N แท่งก่อนหน้า**
+   (ไม่รวมแท่งปัจจุบัน) เป็นกรอบแนวรับ-แนวต้าน
+2. **Spring → BUY** — แท่งแทงหลุด **ใต้ low ของกรอบ** แต่ **ปิดกลับเข้ามาในกรอบ**
+   = เบรกหลอกลง (failed breakdown) แรงขายหมด → กลับตัวขึ้น
+3. **Upthrust/UTAD → SELL** — แท่งแทงทะลุ **เหนือ high ของกรอบ** แต่ **ปิดกลับใต้กรอบ**
+   = เบรกหลอกขึ้น (failed breakout) แรงซื้อหมด → กลับตัวลง
+4. **Effort vs Result (Volume)** — Spring/Upthrust ที่ดีมักมาพร้อม **วอลุ่มพุ่ง**
+   ต้อง `volume ≥ ค่าเฉลี่ย × InpSpringVolMult` จึงยืนยัน
+5. **SOS/SOW (option)** — เปิด `InpTradeBreakout` เพื่อจับ **เบรกจริงพร้อมวอลุ่มแรง**
+   (SOS ปิดเหนือกรอบ = Buy ต่อเนื่อง, SOW ปิดใต้กรอบ = Sell ต่อเนื่อง)
+
+**No-Repaint:** กรอบสร้างจากแท่ง**ก่อนหน้า**ล้วน ๆ และประเมินเฉพาะ**แท่งที่ปิดแล้ว**
+(MT5 ข้ามแท่ง index 0 ที่กำลังวิ่ง / Pine ใช้ `[1]` + `offset = -1`) ลูกศรจึงไม่ขยับ
+
+**พารามิเตอร์สำคัญ (MT5 / Pine)**
+
+| MT5 | Pine | ค่าเริ่มต้น | ความหมาย |
+|---|---|---|---|
+| `InpRangeLookback` | `rangeLookback` | 20 | จำนวนแท่งที่ใช้สร้างกรอบ |
+| `InpPenetrationPts` | `penTicks` | 0 | ระยะแทงหลุดขั้นต่ำ (points/ticks) |
+| `InpRecoveryFrac` | `recoveryFrac` | 0 | ระยะดีดกลับเข้ากรอบขั้นต่ำ (% ของความสูงกรอบ) |
+| `InpUseVolume` | `useVolume` | true | บังคับยืนยันด้วยวอลุ่ม |
+| `InpVolMAPeriod` | `volMAPeriod` | 20 | คาบเฉลี่ยวอลุ่ม |
+| `InpSpringVolMult` | `springVolMlt` | 1.5 | Spring/Upthrust ต้องวอลุ่ม ≥ เฉลี่ย × ค่านี้ |
+| `InpTradeSpring` | `tradeSpring` | true | เปิดสัญญาณ Spring/Upthrust |
+| `InpTradeBreakout` | `tradeBreakout` | false | เปิดสัญญาณ SOS/SOW (เบรกต่อเนื่อง) |
+
+> **หมายเหตุเรื่องวอลุ่ม:** Forex บน MT5 เป็น **tick volume** (ไม่ใช่วอลุ่มจริง)
+> ส่วน TradingView ใช้ volume ของแพลตฟอร์มเอง ผลจึงต่างกันได้ตามธรรมชาติของข้อมูล
+> ถ้าเทรดหุ้น/ฟิวเจอร์สที่มี real volume ตั้ง `InpUseRealVolume = true` ใน MT5
+
+**Buffer (MT5)**: 0 = Buy, 1 = Sell, 2 = Range High, 3 = Range Low
+
+## Elliott Signal (Wave-3 Breakout) — MT5 + TradingView
+
+`Elliott_Signal.mq5` และ `Elliott_Signal.pine` — Elliott Wave แบบ**นับอัตโนมัติเต็มรูป
+มักจะ repaint** ตัวนี้จึงเลือกทำเฉพาะจุดเข้าที่ **ความน่าจะเป็นสูงสุดและ non-repaint**
+คือ **จังหวะเบรกเข้าคลื่น 3**
+
+**ตรรกะ**
+
+1. **Swing Pivots** — หา pivot high/low แบบ fractal ที่ยืนยันหลังผ่านไป `Depth` แท่ง
+   (pivot ที่ยืนยันแล้ว **ไม่ขยับอีก**)
+2. **โครงคลื่น 1-2** — ใช้ pivot 3 จุดสลับกัน P0-P1-P2
+   - **ขาขึ้น:** P0 (low) → P1 (high) → P2 (low)
+   - ตรวจ **กฎเหล็กข้อ 1 ของ Elliott:** คลื่น 2 ห้ามลงต่ำกว่าจุดเริ่มคลื่น 1
+     → ต้อง `P2 > P0` (และ `P2 < P1`)
+3. **Trigger (BUY)** — เมื่อราคา **ปิดทะลุเหนือ P1** (ยอดคลื่น 1) = คลื่น 3 เริ่มวิ่ง
+   ขาลงกลับด้าน (P0 high → P1 low → P2 high, ปิดหลุดใต้ P1 = SELL)
+4. **เป้า Fibonacci** — คำนวณเป้าคลื่น 3 ที่ **1.618 เท่าของคลื่น 1** วัดจาก P2
+   (MT5 แสดงในข้อความแจ้งเตือน / Pine วาดเป็น label บนกราฟ)
+
+**No-Repaint:** ใช้ pivot ที่**ยืนยันแล้ว**เท่านั้น + ทริกเกอร์เป็นการ**ปิดทะลุ**บนแท่งปิด
+จึงไม่ย้อนแก้ (แลกกับ **ดีเลย์ `Depth` แท่ง** ในการยืนยัน pivot ซึ่งเป็นราคาที่ต้องจ่ายเพื่อไม่ repaint)
+
+**พารามิเตอร์สำคัญ (MT5 / Pine)**
+
+| MT5 | Pine | ค่าเริ่มต้น | ความหมาย |
+|---|---|---|---|
+| `InpDepth` | `depth` | 5 | จำนวนแท่งสองข้างที่ใช้ยืนยัน pivot (มาก = swing ใหญ่ขึ้น, ดีเลย์มากขึ้น) |
+| `InpMinSwingPts` | `minSwingTicks` | 0 | ขนาด swing ขั้นต่ำเทียบ pivot ก่อนหน้า (กรอง noise) |
+| `InpMaxWave2Retr` | `maxWave2Retr` | 100 | คลื่น 2 ย่อได้ไม่เกิน % ของคลื่น 1 (<100 = เข้มขึ้น) |
+| `InpWave3Ext` | `wave3Ext` | 1.618 | ตัวคูณ Fibonacci เป้าคลื่น 3 |
+
+**Buffer (MT5)**: 0 = Buy, 1 = Sell, 2 = Pivot High marker, 3 = Pivot Low marker
+
+> **ข้อจำกัดที่ต้องเข้าใจ:** นี่คือ Elliott แบบ "ช่วยจับจังหวะเข้า" ไม่ใช่การนับคลื่น
+> 1-2-3-4-5 / A-B-C ครบทั้งชุด (ซึ่งมีทางเลือกการนับหลายแบบและ repaint โดยธรรมชาติ)
+> โฟกัสที่จุดเข้าคลื่น 3 ที่ผ่านกฎข้อ 1 — เป็นจุดที่โค้ดตัดสินได้ชัดและเทรดได้จริง
+
+## วิธีติดตั้ง (Wyckoff / Elliott)
+
+- **MT5:** วาง `.mq5` ใน `MQL5/Indicators/` → คอมไพล์ (F7) → ลากลงกราฟ
+  (สองตัวนี้ **ไม่ต้องพึ่ง VWAP.ex5** ทำงานอิสระ)
+- **TradingView:** เปิด Pine Editor → วางเนื้อหา `.pine` → Save → Add to chart
+  → ตั้ง Alert จากเงื่อนไข "Wyckoff Buy/Sell" หรือ "Elliott Buy/Sell"
+
 ## ข้อควรระวัง
 
 - VWAP เดิมออกแบบสำหรับตลาดที่มี volume จริง (หุ้น/ฟิวเจอร์ส) การใช้กับ
@@ -184,3 +269,6 @@ void OnTick()
   volume จริง
 - ควรใช้ Anchor แบบ **Session** สำหรับ intraday และ **Week/Month**
   สำหรับ swing
+- **Wyckoff/Elliott เป็นเครื่องมือช่วยตัดสินใจ** ไม่ใช่ระบบเทรดอัตโนมัติสำเร็จรูป
+  ควรใช้คู่กับการบริหารความเสี่ยง (stop loss / position sizing) และยืนยันด้วย
+  บริบทตลาดเสมอ — โดยเฉพาะควรทดสอบ backtest ก่อนใช้เงินจริง

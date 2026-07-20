@@ -1,0 +1,141 @@
+// © Indicator
+//@version=5
+// =====================================================================
+//  Elliott Wave 3 breakout entry from confirmed swing pivots
+// ---------------------------------------------------------------------
+//  Strategy logic (mirror of the MT5 Elliott_Signal indicator)
+//    * Pivots : fractal swing highs/lows via ta.pivothigh/pivotlow,
+//               confirmed `Depth` bars later (a pivot never moves).
+//    * Setup  : three alternating pivots P0-P1-P2 shaped like wave 1 +
+//               wave 2, validated by Elliott's core rule (wave 2 must
+//               not retrace past the start of wave 1).
+//        BUY  : P0 low, P1 high, P2 low  with P2 > P0, P2 < P1
+//        SELL : P0 high, P1 low, P2 high with P2 < P0, P2 > P1
+//    * Trigger: CLOSE breaks the wave-1 extreme (P1) -> wave 3 on.
+//    * Target : Fibonacci 1.618 extension of wave 1, from P2.
+//
+//  No-Repaint: pivots are only used once confirmed, and signals are
+//  evaluated on the previous CLOSED bar and drawn with offset = -1.
+// =====================================================================
+indicator("Elliott Signal", overlay = true, max_labels_count = 500)
+
+// ------------------------- Inputs ------------------------------------
+grpPiv = "Swing pivots"
+depth         = input.int(5, "Fractal depth (bars each side)", minval = 1, group = grpPiv)
+minSwingTicks = input.float(0, "Min swing size vs prev pivot (ticks, 0 = off)", minval = 0, group = grpPiv)
+
+grpRules = "Elliott rules"
+maxWave2Retr = input.float(100, "Max wave-2 retrace of wave 1 (%)", minval = 1, maxval = 100, group = grpRules)
+
+grpFib = "Fibonacci target"
+wave3Ext = input.float(1.618, "Wave-3 extension of wave 1", minval = 0, group = grpFib)
+
+grpDisp = "Display"
+showPivots = input.bool(true, "Mark confirmed pivots", group = grpDisp)
+showTarget = input.bool(true, "Label wave-3 target on signal", group = grpDisp)
+
+// ------------------------- Pivot detection ---------------------------
+minSwing = minSwingTicks * syminfo.mintick
+
+// Confirmed `depth` bars back; non-na only on the confirming bar.
+ph = ta.pivothigh(high, depth, depth)
+pl = ta.pivotlow(low,  depth, depth)
+
+// Last-3 pivot state held in global arrays (index 2 = newest).
+// Mutating a global array by reference inside a function is allowed.
+var array<float> pPrice = array.new_float()
+var array<bool>  pIsHigh = array.new_bool()
+var array<int>   pBar    = array.new_int()
+
+f_push(_price, _isHigh, _bar) =>
+    n = array.size(pPrice)
+    if n == 0
+        array.push(pPrice, _price)
+        array.push(pIsHigh, _isHigh)
+        array.push(pBar, _bar)
+    else if array.get(pIsHigh, n - 1) == _isHigh
+        // same type as newest pivot -> keep the more extreme one
+        cur = array.get(pPrice, n - 1)
+        if (_isHigh ? _price > cur : _price < cur)
+            array.set(pPrice, n - 1, _price)
+            array.set(pBar,   n - 1, _bar)
+    else
+        // alternating pivot (optional min-swing filter)
+        lastP = array.get(pPrice, n - 1)
+        if minSwing <= 0 or math.abs(_price - lastP) >= minSwing
+            array.push(pPrice, _price)
+            array.push(pIsHigh, _isHigh)
+            array.push(pBar, _bar)
+            if array.size(pPrice) > 3
+                array.shift(pPrice)
+                array.shift(pIsHigh)
+                array.shift(pBar)
+
+pivBar = bar_index - depth   // confirming bar of a pivot found this bar
+if not na(ph)
+    f_push(ph, true, pivBar)
+if not na(pl)
+    f_push(pl, false, pivBar)
+
+// Pivot markers (drawn at the confirmed pivot's real location)
+plotshape(showPivots and not na(ph) ? high[depth] : na, "Pivot High", style = shape.circle,
+     location = location.absolute, color = color.new(color.orange, 0), size = size.tiny, offset = -depth)
+plotshape(showPivots and not na(pl) ? low[depth] : na, "Pivot Low", style = shape.circle,
+     location = location.absolute, color = color.new(color.blue, 0), size = size.tiny, offset = -depth)
+
+// ------------------------- Setup + breakout --------------------------
+ready = array.size(pPrice) == 3
+p0 = ready ? array.get(pPrice, 0) : na
+p1 = ready ? array.get(pPrice, 1) : na
+p2 = ready ? array.get(pPrice, 2) : na
+t0 = ready ? array.get(pIsHigh, 0) : na
+t1 = ready ? array.get(pIsHigh, 1) : na
+t2 = ready ? array.get(pIsHigh, 2) : na
+p1Bar = ready ? array.get(pBar, 1) : na
+
+maxRetr = maxWave2Retr * 0.01
+
+var int lastBuyBar = na
+var int lastSellBar = na
+
+// BULLISH: low(P0) -> high(P1) -> low(P2)
+bullShape = ready and not t0 and t1 and not t2
+wave1Up   = p1 - p0
+bullRule  = bullShape and p2 > p0 and p2 < p1 and wave1Up > 0 and (p1 - p2) <= wave1Up * maxRetr
+buyRaw    = bullRule and close > p1 and close[1] <= p1 and (na(lastBuyBar) or p1Bar != lastBuyBar)
+
+// BEARISH: high(P0) -> low(P1) -> high(P2)
+bearShape = ready and t0 and not t1 and t2
+wave1Dn   = p0 - p1
+bearRule  = bearShape and p2 < p0 and p2 > p1 and wave1Dn > 0 and (p2 - p1) <= wave1Dn * maxRetr
+sellRaw   = bearRule and close < p1 and close[1] >= p1 and (na(lastSellBar) or p1Bar != lastSellBar)
+
+if buyRaw
+    lastBuyBar := p1Bar
+if sellRaw
+    lastSellBar := p1Bar
+
+// ---- No-Repaint: evaluate on the closed bar, draw with offset = -1 ----
+buySignal  = buyRaw[1]
+sellSignal = sellRaw[1]
+
+buyTarget  = p2 + wave1Up * wave3Ext
+sellTarget = p2 - wave1Dn * wave3Ext
+
+plotshape(buySignal,  title = "Buy",  style = shape.triangleup,   location = location.belowbar,
+     color = color.lime, size = size.small, offset = -1, text = "W3")
+plotshape(sellSignal, title = "Sell", style = shape.triangledown, location = location.abovebar,
+     color = color.red,  size = size.small, offset = -1, text = "W3")
+
+if showTarget and buySignal
+    label.new(bar_index - 1, low[1], "W3 tgt " + str.tostring(buyTarget[1], format.mintick),
+         yloc = yloc.belowbar, style = label.style_label_up, color = color.new(color.lime, 20),
+         textcolor = color.black, size = size.small)
+if showTarget and sellSignal
+    label.new(bar_index - 1, high[1], "W3 tgt " + str.tostring(sellTarget[1], format.mintick),
+         yloc = yloc.abovebar, style = label.style_label_down, color = color.new(color.red, 20),
+         textcolor = color.white, size = size.small)
+
+// ------------------------- Alerts ------------------------------------
+alertcondition(buySignal,  "Elliott Buy",  "Elliott BUY: wave-3 breakout above wave-1 high")
+alertcondition(sellSignal, "Elliott Sell", "Elliott SELL: wave-3 breakout below wave-1 low")

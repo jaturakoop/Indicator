@@ -1,0 +1,81 @@
+// © Indicator
+//@version=5
+// =====================================================================
+//  Wyckoff Spring / Upthrust (+ optional SOS/SOW) — No-Repaint signals
+// ---------------------------------------------------------------------
+//  Strategy logic (mirror of the MT5 Wyckoff_Signal indicator)
+//    * Trading Range : rolling highest-high / lowest-low over N PRIOR
+//                      bars (the evaluated bar itself is excluded).
+//    * Spring  (BUY) : bar pierces below range low but CLOSES back
+//                      inside the range -> failed breakdown.
+//    * Upthrust(SELL): bar pierces above range high but CLOSES back
+//                      inside the range -> failed breakout.
+//    * SOS/SOW       : optional. A fresh decisive CLOSE outside the
+//                      range on strong volume -> breakout continuation.
+//    * Effort/Result : volume gate vs its moving average.
+//
+//  No-Repaint: the range is built from bars strictly BEFORE the
+//  evaluated bar, signals are evaluated on the previous CLOSED bar and
+//  drawn with offset = -1, so a printed marker never moves.
+// =====================================================================
+indicator("Wyckoff Signal", overlay = true, max_labels_count = 500)
+
+// ------------------------- Inputs ------------------------------------
+grpRange = "Trading Range"
+rangeLookback  = input.int(20, "Bars to build the range (prior bars)", minval = 2, group = grpRange)
+penTicks       = input.float(0, "Min penetration beyond range (ticks)", minval = 0, group = grpRange)
+recoveryFrac   = input.float(0, "Min recovery back inside range (% of height)", minval = 0, group = grpRange)
+
+grpVol = "Volume (Effort vs Result)"
+useVolume    = input.bool(true, "Require volume confirmation", group = grpVol)
+volMAPeriod  = input.int(20, "Volume MA period", minval = 1, group = grpVol)
+springVolMlt = input.float(1.5, "Spring/Upthrust vol >= avg *", minval = 0, group = grpVol)
+breakVolMlt  = input.float(1.5, "SOS/SOW vol >= avg *", minval = 0, group = grpVol)
+
+grpEvents = "Events to trade"
+tradeSpring   = input.bool(true,  "Spring->BUY / Upthrust->SELL (reversal)", group = grpEvents)
+tradeBreakout = input.bool(false, "SOS->BUY / SOW->SELL (continuation)", group = grpEvents)
+
+grpDisp = "Display"
+showRange  = input.bool(true, "Draw range high/low lines", group = grpDisp)
+
+// ------------------------- Calculations ------------------------------
+pen = penTicks * syminfo.mintick
+
+// Range from N bars strictly BEFORE the current bar (exclude current bar)
+rangeHi = ta.highest(high, rangeLookback)[1]
+rangeLo = ta.lowest(low,  rangeLookback)[1]
+rangeHeight = rangeHi - rangeLo
+minRecovery = recoveryFrac * 0.01 * rangeHeight
+
+// Volume: average of prior bars, current bar excluded
+volNow = volume
+volAvg = ta.sma(volume, volMAPeriod)[1]
+springVolOk = not useVolume or (volAvg > 0 and volNow >= volAvg * springVolMlt)
+breakVolOk  = not useVolume or (volAvg > 0 and volNow >= volAvg * breakVolMlt)
+
+// Wyckoff events on the CURRENT bar (all inputs above are from prior bars)
+spring   = tradeSpring   and low  < rangeLo - pen and close > rangeLo + minRecovery and springVolOk
+upthrust = tradeSpring   and high > rangeHi + pen and close < rangeHi - minRecovery and springVolOk
+sos      = tradeBreakout and close > rangeHi + pen and close[1] <= rangeHi and breakVolOk
+sow      = tradeBreakout and close < rangeLo - pen and close[1] >= rangeLo and breakVolOk
+
+buyRaw  = spring or sos
+sellRaw = upthrust or sow
+
+// ---- No-Repaint: evaluate on the closed bar, draw with offset = -1 ----
+buySignal  = buyRaw[1]
+sellSignal = sellRaw[1]
+
+// ------------------------- Plots -------------------------------------
+plot(showRange ? rangeHi : na, "Range High", color = color.new(color.silver, 0), style = plot.style_stepline)
+plot(showRange ? rangeLo : na, "Range Low",  color = color.new(color.silver, 0), style = plot.style_stepline)
+
+plotshape(buySignal,  title = "Buy",  style = shape.triangleup,   location = location.belowbar,
+     color = color.lime, size = size.small, offset = -1, text = "Spring")
+plotshape(sellSignal, title = "Sell", style = shape.triangledown, location = location.abovebar,
+     color = color.red,  size = size.small, offset = -1, text = "Upthrust")
+
+// ------------------------- Alerts ------------------------------------
+alertcondition(buySignal,  "Wyckoff Buy",  "Wyckoff BUY: Spring / SOS (failed breakdown or strong breakout)")
+alertcondition(sellSignal, "Wyckoff Sell", "Wyckoff SELL: Upthrust / SOW (failed breakout or strong breakdown)")
