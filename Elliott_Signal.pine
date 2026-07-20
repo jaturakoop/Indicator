@@ -70,6 +70,7 @@ f_push(_price, _isHigh, _bar) =>
                 array.shift(pPrice)
                 array.shift(pIsHigh)
                 array.shift(pBar)
+    0   // fixed return type: the if/else above runs only for side effects
 
 pivBar = bar_index - depth   // confirming bar of a pivot found this bar
 if not na(ph)
