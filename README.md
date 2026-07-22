@@ -177,6 +177,64 @@ void OnTick()
 > TradingView ใช้ built-in `ta.vwap` ซึ่งอิง volume ของแพลตฟอร์มเอง
 > ผลลัพธ์อาจต่างจาก MT5 (ที่ใช้ tick volume ของโบรก) เล็กน้อยตามธรรมชาติของข้อมูล
 
+## POI Reversal — Sweep + iFVG + CISD + MSS (ยืนยันการกลับตัว)
+
+`POI_Reversal_Signal.mq5` (MT5) และ `POI_Reversal_Signal.pine` (TradingView)
+เป็น indicator ยิงลูกศรเมื่อ **ลำดับการกลับตัวคุณภาพสูงครบทั้ง 6 ขั้น**
+ตามโมเดล ICT/Smart-Money ที่อธิบายไว้ ตัวนี้ **ยืนยัน (confirm)** การกลับตัว
+ไม่ใช่การเดายอด/ก้น — จะไม่มีสัญญาณจนกว่าทุกเงื่อนไขจะเกิดครบตามลำดับ
+
+**ลำดับเหตุการณ์ที่ต้องเกิด (ยกตัวอย่างฝั่งกลับตัวขึ้น = Buy)**
+
+| ขั้น | เหตุการณ์ | เงื่อนไขในโค้ด |
+|---|---|---|
+| 1 | **POI** — ราคาวิ่งลงเข้าโซนสภาพคล่อง (swing low เดิม) | มี swing low ก่อนหน้าที่ยืนยันแล้ว (fractal); เปิด `InpUsePOIZone` เพื่อบังคับให้อยู่ในโซนที่กำหนดเองได้ |
+| 2 | **FVG** — มี Bearish FVG ทิ้งไว้ระหว่างทางที่วิ่งลง | ตรวจ 3 แท่ง: `high[i] < low[i-2]` และ FVG ยังไม่ถูกทะลุ + อายุไม่เกิน `InpFVGMaxAge` |
+| 3 | **Sweep** — กวาดสภาพคล่อง (ไส้หลุดใต้ swing low แล้วปิดกลับเหนือ) | `low[i] < swingLow` **และ** `close[i] > swingLow` |
+| 4 | **iFVG** — ปิดกลับ**เหนือ**โซน Bearish FVG (พลิกเป็น iFVG) | `close[i] > refFVG.top` |
+| 5 | **CISD** — ปิดเหนือ opening-range ของขาอิมพัลส์ (Change in State of Direction) | `close[i] > cisdLevel` (open สูงสุดของชุดแท่งขาลงที่ต่อเนื่องกันก่อนกวาด) |
+| 6 | **MSS** — ปิดเหนือ swing high ของชุดแท่งที่เกิด CISD (Market Structure Shift) | `close[i] > mssLevel` → **ยิงลูกศร Buy** |
+
+ฝั่งกลับตัวลง (Sell) ใช้ตรรกะสะท้อนกลับทุกข้อ (กวาด buy-side liquidity เหนือ
+swing high, Bullish FVG, ปิดต่ำกว่า iFVG/CISD/MSS)
+
+**ตำแหน่งเข้าออร์เดอร์ (ข้อ 8):** เมื่อลูกศรขึ้น indicator จะวาดเส้นอ้างอิง
+3 เส้น (เปิด/ปิดด้วย `InpDrawLevels`) — **iFVG** (ฟ้า), **CISD** (ทอง),
+**MSS** (เขียว/แดง) ใช้เป็นจุดรอรีเทสต์เพื่อเข้าออร์เดอร์ตามที่อธิบายไว้
+
+**No-Repaint:** swing ยืนยันด้วย fractal ที่ต้องมีแท่งด้านขวาครบ และทุกขั้นตอน
+ประเมินจาก**แท่งที่ปิดแล้วเท่านั้น** (ข้ามแท่งกำลังวิ่ง) ลูกศรที่ขึ้นแล้วจึงไม่ขยับ/ไม่หาย
+ถ้าลำดับไม่ครบภายใน `InpMaxBars` แท่งหลังการกวาด สถานะจะรีเซ็ต (setup ตกไป)
+
+**พารามิเตอร์สำคัญ (MT5)**
+
+| พารามิเตอร์ | ค่าเริ่มต้น | ความหมาย |
+|---|---|---|
+| `InpSwingLen` | 3 | ความยาว fractal ของ swing (แท่งซ้าย/ขวาข้างละ) |
+| `InpLegLookback` | 12 | ระยะมองย้อนหาขาอิมพัลส์สำหรับ CISD/MSS (แท่ง) |
+| `InpFVGMaxAge` | 40 | อายุสูงสุดของ FVG ที่ทิ้งไว้ ณ จุดกวาด (แท่ง) |
+| `InpUsePOIZone` | false | บังคับให้จุดกวาดต้องอยู่ในโซน POI ที่กำหนดเอง |
+| `InpPOIUpper` / `InpPOILower` | 0 / 0 | ราคาบน/ล่างของโซน POI (ใช้เมื่อเปิด `InpUsePOIZone`) |
+| `InpMaxBars` | 30 | จำนวนแท่งสูงสุดจากกวาดถึง MSS ก่อนรีเซ็ต |
+| `InpArrowOffsetPoints` | 150 | ระยะลูกศรห่างจากแท่ง (points) |
+| `InpDrawLevels` | true | วาดเส้นอ้างอิง iFVG / CISD / MSS |
+| `InpLevelExtendBars` | 12 | ความยาวเส้นอ้างอิงที่ยื่นไปทางขวา (แท่ง) |
+| `InpAlertPopup` / `InpAlertPush` | false | แจ้งเตือนป๊อปอัป / มือถือ |
+
+**Buffer สำหรับต่อยอดใน EA**
+
+| Index | Buffer |
+|---|---|
+| 0 | Buy arrow (มีค่า = ยืนยันกลับตัวขึ้นที่แท่งนั้น) |
+| 1 | Sell arrow |
+
+> ตัวนี้ **ไม่พึ่ง** `VWAP.ex5` หรือ indicator อื่น — คำนวณ FVG/swing/สภาพคล่อง
+> จาก OHLC โดยตรง วางไฟล์ `POI_Reversal_Signal.mq5` ใน `MQL5/Indicators/` แล้วคอมไพล์
+
+**เวอร์ชัน TradingView:** เปิด Pine Editor วางเนื้อหา `POI_Reversal_Signal.pine`
+→ Save → Add to chart ตั้ง Alert ได้จากเงื่อนไข "POI Buy reversal" / "POI Sell reversal"
+ตรรกะเหมือน MT5 ทุกขั้น (Pine ใช้ `ta.pivothigh/low` ยืนยัน swing แบบ non-repaint)
+
 ## ข้อควรระวัง
 
 - VWAP เดิมออกแบบสำหรับตลาดที่มี volume จริง (หุ้น/ฟิวเจอร์ส) การใช้กับ
@@ -184,3 +242,8 @@ void OnTick()
   volume จริง
 - ควรใช้ Anchor แบบ **Session** สำหรับ intraday และ **Week/Month**
   สำหรับ swing
+- **POI Reversal** เป็นสัญญาณ**ยืนยัน** ไม่ใช่ทำนายยอด/ก้น — จะเข้าช้ากว่าจุด
+  ต่ำสุด/สูงสุดจริงเสมอ (แลกกับความแม่นยำที่สูงขึ้น) การตรวจ POI/FVG/สภาพคล่อง
+  แบบอัตโนมัติเป็นการ**ประมาณ**การอ่านกราฟด้วยมือ ควรใช้คู่กับการยืนยันบริบท
+  (HTF bias, โซนสำคัญ) และปรับ `InpSwingLen` / `InpLegLookback` ให้เข้ากับ
+  TF และสินค้าที่เทรด
