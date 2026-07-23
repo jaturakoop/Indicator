@@ -1,0 +1,410 @@
+// © Indicator
+//@version=5
+// =====================================================================
+//  TheReversal_R0 — POI + Sweep + iFVG + CISD + MSS reversal system
+// ---------------------------------------------------------------------
+//  Revision tag: R0  (bump to R1, R2, ... on every change)
+//  TradingView twin of TheReversal_R0.mq5. Same ordered engine:
+//    1) POI Manager    — POI zone from a chosen TF (Swing/FVG/OB/Fibo)
+//    2) FVG Detector   — left-behind Fair Value Gap (entry TF)
+//    3) Sweep Scanner  — liquidity grab at the POI
+//    4) iFVG Confirm   — close back through the FVG
+//    5) CISD Marker    — change in state of direction
+//    6) MSS Checker    — market structure shift = trigger (arrow/alert)
+//    7) Entry Planner  — Entry 1=CISD  2=iFVG  3=OB
+//    8) Dashboard/UI   — live checklist + POI zone boxes
+//
+//  The per-type POI zone is computed INSIDE the HTF security context, so
+//  OB/FVG/Fibo use real higher-timeframe candles. lookahead_off keeps it
+//  non-repainting; every stage advances only on confirmed (closed) bars.
+// =====================================================================
+indicator("TheReversal R0", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 100)
+
+// ------------------------- Inputs (Module 1 + engine) ----------------
+grpPOI = "POI Manager"
+poiTF        = input.timeframe("15", "POI timeframe", group = grpPOI)
+poiType      = input.string("Swing", "POI type", options = ["Swing", "FVG", "OB", "Fibo"], group = grpPOI)
+poiZoneTicks = input.float(80, "Zone thickness Swing (ticks)", minval = 0, group = grpPOI)
+poiTolTicks  = input.float(60, "POI touch tolerance (ticks)", minval = 0, group = grpPOI)
+fibA         = input.float(0.5,   "Fibo near edge", group = grpPOI)
+fibB         = input.float(0.786, "Fibo far edge",  group = grpPOI)
+poiColor     = input.color(color.new(color.blue, 80), "POI zone colour", group = grpPOI)
+
+grpSeq = "Sequence engine"
+swingLen    = input.int(3,  "Fractal swing length", minval = 1, group = grpSeq)
+legLookback = input.int(12, "Impulse-leg lookback (CISD/OB)", minval = 2, group = grpSeq)
+fvgMaxAge   = input.int(40, "Max FVG age at sweep (bars)", minval = 1, group = grpSeq)
+maxBars     = input.int(30, "Max bars per phase", minval = 1, group = grpSeq)
+
+grpDisp = "Entry Planner / levels"
+drawZones   = input.bool(true, "Draw POI zone boxes", group = grpDisp)
+drawLevels  = input.bool(true, "Draw Entry / MSS lines", group = grpDisp)
+levelExtend = input.int(12, "Extend lines/zones (bars)", minval = 1, group = grpDisp)
+
+grpDash = "Dashboard"
+showDashboard = input.bool(true, "Show dashboard", group = grpDash)
+dashPos       = input.string("top_right", "Position", options = ["top_right", "top_left", "bottom_right", "bottom_left"], group = grpDash)
+
+// ------------------------- Constants ---------------------------------
+ST_IDLE  = 0
+ST_POI   = 1
+ST_SWEPT = 2
+ST_IFVG  = 3
+ST_CISD  = 4
+
+tol = poiTolTicks * syminfo.mintick
+zh  = poiZoneTicks * syminfo.mintick
+
+// ============================ MODULE 1 ===============================
+// POI zone computed in the HTF context. Returns support (bull) and
+// resistance (bear) zones as [top, bot, target]. Pivot bar = swingLen back.
+poiZoneCalc() =>
+    var float sT = na
+    var float sB = na
+    var float sG = na
+    var float rT = na
+    var float rB = na
+    var float rG = na
+    var float prevLo = na
+    var float prevHi = na
+    ph = ta.pivothigh(high, swingLen, swingLen)
+    pl = ta.pivotlow(low, swingLen, swingLen)
+    pHi = high[swingLen]
+    pLo = low[swingLen]
+    // ---- support zone from a swing low ----
+    if not na(pl)
+        if poiType == "Swing"
+            sB := pLo
+            sT := pLo + zh
+            sG := pLo
+        else if poiType == "OB"
+            sT := pHi
+            sB := pLo
+            sG := pLo
+        else if poiType == "FVG"
+            if low[swingLen-1] > high[swingLen+1]
+                sT := low[swingLen-1]
+                sB := high[swingLen+1]
+                sG := high[swingLen+1]
+            else
+                sB := pLo
+                sT := pLo + zh
+                sG := pLo
+        else if poiType == "Fibo" and not na(prevHi) and prevHi > pLo
+            sT := prevHi - fibA * (prevHi - pLo)
+            sB := prevHi - fibB * (prevHi - pLo)
+            sG := sB
+        prevLo := pLo
+    // ---- resistance zone from a swing high ----
+    if not na(ph)
+        if poiType == "Swing"
+            rT := pHi
+            rB := pHi - zh
+            rG := pHi
+        else if poiType == "OB"
+            rT := pHi
+            rB := pLo
+            rG := pHi
+        else if poiType == "FVG"
+            if high[swingLen-1] < low[swingLen+1]
+                rT := low[swingLen+1]
+                rB := high[swingLen-1]
+                rG := low[swingLen+1]
+            else
+                rT := pHi
+                rB := pHi - zh
+                rG := pHi
+        else if poiType == "Fibo" and not na(prevLo) and pHi > prevLo
+            rB := prevLo + fibA * (pHi - prevLo)
+            rT := prevLo + fibB * (pHi - prevLo)
+            rG := rT
+        prevHi := pHi
+    [sT, sB, sG, rT, rB, rG]
+
+[supTop, supBot, supTgt, resTop, resBot, resTgt] = request.security(syminfo.tickerid, poiTF, poiZoneCalc(), lookahead = barmerge.lookahead_off)
+
+// ============================ MODULE 5/7 =============================
+// CISD opening range + order block (entry-TF, constant offsets).
+downLegCISD() =>
+    lvl = open
+    started = false
+    broke = false
+    for k = 0 to legLookback
+        if not broke and close[k] < open[k]
+            lvl := started ? math.max(lvl, open[k]) : open[k]
+            started := true
+        else if started
+            broke := true
+    lvl
+upLegCISD() =>
+    lvl = open
+    started = false
+    broke = false
+    for k = 0 to legLookback
+        if not broke and close[k] > open[k]
+            lvl := started ? math.min(lvl, open[k]) : open[k]
+            started := true
+        else if started
+            broke := true
+    lvl
+bullOB() =>
+    lo = low
+    obh = high
+    for k = 1 to legLookback
+        if low[k] < lo
+            lo := low[k]
+            obh := high[k]
+    obh
+bearOB() =>
+    hi = high
+    obl = low
+    for k = 1 to legLookback
+        if high[k] > hi
+            hi := high[k]
+            obl := low[k]
+    obl
+
+// ============================ MODULE 2 ===============================
+var float bearTop = na
+var float bearBot = na
+var int   bearBar = na
+var float bullTop = na
+var float bullBot = na
+var int   bullBar = na
+
+// ------------------------- State machines ----------------------------
+var int   bullStage   = ST_IDLE
+var int   bullPoiBar  = na
+var int   bullSweep   = na
+var float bullPoiTop  = na
+var float bullPoiTgt  = na
+var float bullRefTop  = na
+var float bullCISD    = na
+var float bullIFVG    = na
+var float bullOBv     = na
+var float bullMSS     = na
+var float bullRunHigh = na
+
+var int   bearStage   = ST_IDLE
+var int   bearPoiBar  = na
+var int   bearSweep   = na
+var float bearPoiBot  = na
+var float bearPoiTgt  = na
+var float bearRefBot  = na
+var float bearCISD    = na
+var float bearIFVG    = na
+var float bearOBv     = na
+var float bearMSS     = na
+var float bearRunLow  = na
+
+var int lastBuyBar  = na
+var int lastSellBar = na
+var int lastBuyTime  = na
+var int lastSellTime = na
+
+buySignal  = false
+sellSignal = false
+
+if barstate.isconfirmed and bar_index > swingLen * 2 + legLookback + 2
+    // MODULE 2 — FVG detector (entry TF)
+    if high < low[2]
+        bearTop := low[2]
+        bearBot := high
+        bearBar := bar_index
+    if low > high[2]
+        bullTop := low
+        bullBot := high[2]
+        bullBar := bar_index
+    if not na(bearBar) and bar_index > bearBar and close > bearTop and bullStage == ST_IDLE
+        bearBar := na
+    if not na(bullBar) and bar_index > bullBar and close < bullBot and bearStage == ST_IDLE
+        bullBar := na
+
+    // ---- BULLISH machine ----
+    if bullStage == ST_POI and bar_index - bullPoiBar > maxBars
+        bullStage := ST_IDLE
+    if bullStage >= ST_SWEPT and bar_index - bullSweep > maxBars
+        bullStage := ST_IDLE
+    if bullStage == ST_IDLE and not na(supTgt)
+        fvgOk = not na(bearBar) and (bar_index - bearBar) <= fvgMaxAge and bearTop > supTgt
+        if low <= supTop + tol and fvgOk
+            bullStage := ST_POI
+            bullPoiBar := bar_index
+            bullPoiTop := supTop
+            bullPoiTgt := supTgt
+            bullRefTop := bearTop
+    if bullStage == ST_POI and low < bullPoiTgt
+        if close > bullPoiTgt
+            bullStage := ST_SWEPT
+            bullSweep := bar_index
+            bullCISD := downLegCISD()
+            bullOBv := bullOB()
+            bullRunHigh := high
+        else
+            bullStage := ST_IDLE
+    if bullStage == ST_SWEPT or bullStage == ST_IFVG
+        bullRunHigh := math.max(nz(bullRunHigh, high), high)
+    if bullStage == ST_SWEPT and close > bullRefTop
+        bullStage := ST_IFVG
+        bullIFVG := bullRefTop
+    if bullStage == ST_IFVG and close > bullCISD
+        bullStage := ST_CISD
+        bullMSS := bullRunHigh
+    if bullStage == ST_CISD and close > bullMSS
+        buySignal := true
+        lastBuyBar := bar_index
+        lastBuyTime := time
+        if drawLevels
+            xr = bar_index + levelExtend
+            line.new(bullSweep, bullMSS,  xr, bullMSS,  color = color.lime,   style = line.style_solid)
+            line.new(bullSweep, bullCISD, xr, bullCISD, color = color.orange, style = line.style_dotted)
+            line.new(bullSweep, bullIFVG, xr, bullIFVG, color = color.aqua,   style = line.style_dotted)
+            line.new(bullSweep, bullOBv,  xr, bullOBv,  color = color.fuchsia,style = line.style_dotted)
+            label.new(xr, bullMSS,  " MSS (trigger)", style = label.style_none, textcolor = color.lime,    size = size.small)
+            label.new(xr, bullCISD, " Entry 1: CISD", style = label.style_none, textcolor = color.orange,  size = size.small)
+            label.new(xr, bullIFVG, " Entry 2: iFVG", style = label.style_none, textcolor = color.aqua,    size = size.small)
+            label.new(xr, bullOBv,  " Entry 3: OB",   style = label.style_none, textcolor = color.fuchsia, size = size.small)
+        bullStage := ST_IDLE
+
+    // ---- BEARISH machine ----
+    if bearStage == ST_POI and bar_index - bearPoiBar > maxBars
+        bearStage := ST_IDLE
+    if bearStage >= ST_SWEPT and bar_index - bearSweep > maxBars
+        bearStage := ST_IDLE
+    if bearStage == ST_IDLE and not na(resTgt)
+        fvgOk = not na(bullBar) and (bar_index - bullBar) <= fvgMaxAge and bullBot < resTgt
+        if high >= resBot - tol and fvgOk
+            bearStage := ST_POI
+            bearPoiBar := bar_index
+            bearPoiBot := resBot
+            bearPoiTgt := resTgt
+            bearRefBot := bullBot
+    if bearStage == ST_POI and high > bearPoiTgt
+        if close < bearPoiTgt
+            bearStage := ST_SWEPT
+            bearSweep := bar_index
+            bearCISD := upLegCISD()
+            bearOBv := bearOB()
+            bearRunLow := low
+        else
+            bearStage := ST_IDLE
+    if bearStage == ST_SWEPT or bearStage == ST_IFVG
+        bearRunLow := math.min(nz(bearRunLow, low), low)
+    if bearStage == ST_SWEPT and close < bearRefBot
+        bearStage := ST_IFVG
+        bearIFVG := bearRefBot
+    if bearStage == ST_IFVG and close < bearCISD
+        bearStage := ST_CISD
+        bearMSS := bearRunLow
+    if bearStage == ST_CISD and close < bearMSS
+        sellSignal := true
+        lastSellBar := bar_index
+        lastSellTime := time
+        if drawLevels
+            xr = bar_index + levelExtend
+            line.new(bearSweep, bearMSS,  xr, bearMSS,  color = color.red,    style = line.style_solid)
+            line.new(bearSweep, bearCISD, xr, bearCISD, color = color.orange, style = line.style_dotted)
+            line.new(bearSweep, bearIFVG, xr, bearIFVG, color = color.aqua,   style = line.style_dotted)
+            line.new(bearSweep, bearOBv,  xr, bearOBv,  color = color.fuchsia,style = line.style_dotted)
+            label.new(xr, bearMSS,  " MSS (trigger)", style = label.style_none, textcolor = color.red,     size = size.small)
+            label.new(xr, bearCISD, " Entry 1: CISD", style = label.style_none, textcolor = color.orange,  size = size.small)
+            label.new(xr, bearIFVG, " Entry 2: iFVG", style = label.style_none, textcolor = color.aqua,    size = size.small)
+            label.new(xr, bearOBv,  " Entry 3: OB",   style = label.style_none, textcolor = color.fuchsia, size = size.small)
+        bearStage := ST_IDLE
+
+// ============================ MODULE 8 : zones + live lines ==========
+var box supBox = na
+var box resBox = na
+var line[]  liveLn = array.new_line()
+var label[] liveLb = array.new_label()
+
+if barstate.islast
+    // POI zone boxes
+    if not na(supBox)
+        box.delete(supBox)
+    if not na(resBox)
+        box.delete(resBox)
+    if drawZones and not na(supTop)
+        supBox := box.new(bar_index - 30, supTop, bar_index + levelExtend, supBot, border_color = color.gray, bgcolor = poiColor)
+    if drawZones and not na(resTop)
+        resBox := box.new(bar_index - 30, resTop, bar_index + levelExtend, resBot, border_color = color.gray, bgcolor = poiColor)
+    // live (forming) setup levels
+    if drawLevels
+        while array.size(liveLn) > 0
+            line.delete(array.pop(liveLn))
+        while array.size(liveLb) > 0
+            label.delete(array.pop(liveLb))
+        xr = bar_index + levelExtend
+        if bullStage >= ST_SWEPT
+            array.push(liveLn, line.new(bullSweep, bullCISD, xr, bullCISD, color = color.orange, style = line.style_dotted))
+            array.push(liveLb, label.new(xr, bullCISD, " Entry 1: CISD", style = label.style_none, textcolor = color.orange, size = size.small))
+            array.push(liveLn, line.new(bullSweep, bullOBv, xr, bullOBv, color = color.fuchsia, style = line.style_dotted))
+            array.push(liveLb, label.new(xr, bullOBv, " Entry 3: OB", style = label.style_none, textcolor = color.fuchsia, size = size.small))
+        if bullStage >= ST_IFVG
+            array.push(liveLn, line.new(bullSweep, bullIFVG, xr, bullIFVG, color = color.aqua, style = line.style_dotted))
+            array.push(liveLb, label.new(xr, bullIFVG, " Entry 2: iFVG", style = label.style_none, textcolor = color.aqua, size = size.small))
+        if bullStage >= ST_CISD
+            array.push(liveLn, line.new(bullSweep, bullMSS, xr, bullMSS, color = color.lime, style = line.style_solid))
+            array.push(liveLb, label.new(xr, bullMSS, " MSS (trigger)", style = label.style_none, textcolor = color.lime, size = size.small))
+        if bearStage >= ST_SWEPT
+            array.push(liveLn, line.new(bearSweep, bearCISD, xr, bearCISD, color = color.orange, style = line.style_dotted))
+            array.push(liveLb, label.new(xr, bearCISD, " Entry 1: CISD", style = label.style_none, textcolor = color.orange, size = size.small))
+            array.push(liveLn, line.new(bearSweep, bearOBv, xr, bearOBv, color = color.fuchsia, style = line.style_dotted))
+            array.push(liveLb, label.new(xr, bearOBv, " Entry 3: OB", style = label.style_none, textcolor = color.fuchsia, size = size.small))
+        if bearStage >= ST_IFVG
+            array.push(liveLn, line.new(bearSweep, bearIFVG, xr, bearIFVG, color = color.aqua, style = line.style_dotted))
+            array.push(liveLb, label.new(xr, bearIFVG, " Entry 2: iFVG", style = label.style_none, textcolor = color.aqua, size = size.small))
+        if bearStage >= ST_CISD
+            array.push(liveLn, line.new(bearSweep, bearMSS, xr, bearMSS, color = color.red, style = line.style_solid))
+            array.push(liveLb, label.new(xr, bearMSS, " MSS (trigger)", style = label.style_none, textcolor = color.red, size = size.small))
+
+// ============================ MODULE 8 : dashboard ===================
+yn(bool b) => b ? "YES" : " - "
+stageName(int stage, bool fired) =>
+    fired ? "ENTRY" : stage == ST_POI ? "at POI" : stage == ST_SWEPT ? "swept" : stage == ST_IFVG ? "iFVG" : stage == ST_CISD ? "awaitMSS" : "idle"
+
+posTable = dashPos == "top_left" ? position.top_left : dashPos == "bottom_right" ? position.bottom_right : dashPos == "bottom_left" ? position.bottom_left : position.top_right
+
+var table dash = na
+if showDashboard and barstate.islast
+    buyFired  = lastBuyBar  == bar_index
+    sellFired = lastSellBar == bar_index
+    poiFoundB = not na(supTgt)
+    poiFoundS = not na(resTgt)
+    inPOIb = not na(supTop) and low <= supTop and high >= supBot
+    inPOIs = not na(resTop) and high >= resBot and low <= resTop
+    entB = (not na(lastBuyBar)  and bar_index - lastBuyBar  <= maxBars) ? "1/2/3" : "-"
+    entS = (not na(lastSellBar) and bar_index - lastSellBar <= maxBars) ? "1/2/3" : "-"
+    sigB = na(lastBuyTime)  ? "-" : str.format_time(lastBuyTime,  "HH:mm", syminfo.timezone)
+    sigS = na(lastSellTime) ? "-" : str.format_time(lastSellTime, "HH:mm", syminfo.timezone)
+
+    if na(dash)
+        dash := table.new(posTable, 3, 12, border_width = 1, frame_color = color.gray, frame_width = 1)
+    table.cell(dash, 0, 0, "TheReversal R0 · POI " + poiType + " " + poiTF, text_color = color.white, text_size = size.small, bgcolor = color.new(color.black, 20))
+    table.cell(dash, 1, 0, "BULL", text_color = color.lime, text_size = size.small, bgcolor = color.new(color.black, 20))
+    table.cell(dash, 2, 0, "BEAR", text_color = color.red,  text_size = size.small, bgcolor = color.new(color.black, 20))
+
+    rows = array.from("POI Found", "Price In POI", "FVG Created", "Liquidity Sweep", "iFVG", "CISD", "MSS Confirmed")
+    bVals = array.from(yn(poiFoundB), yn(inPOIb), yn(not na(bearBar)), yn(bullStage>=ST_SWEPT), yn(bullStage>=ST_IFVG), yn(bullStage>=ST_CISD), yn(buyFired))
+    sVals = array.from(yn(poiFoundS), yn(inPOIs), yn(not na(bullBar)), yn(bearStage>=ST_SWEPT), yn(bearStage>=ST_IFVG), yn(bearStage>=ST_CISD), yn(sellFired))
+    for r = 0 to 6
+        table.cell(dash, 0, r + 1, array.get(rows, r), text_color = color.silver, text_size = size.small)
+        table.cell(dash, 1, r + 1, array.get(bVals, r), text_color = color.aqua, text_size = size.small)
+        table.cell(dash, 2, r + 1, array.get(sVals, r), text_color = color.aqua, text_size = size.small)
+
+    table.cell(dash, 0, 8, "Entry Level", text_color = color.silver, text_size = size.small)
+    table.cell(dash, 1, 8, entB, text_color = color.yellow, text_size = size.small)
+    table.cell(dash, 2, 8, entS, text_color = color.yellow, text_size = size.small)
+    table.cell(dash, 0, 9, "Signal Time", text_color = color.silver, text_size = size.small)
+    table.cell(dash, 1, 9, sigB, text_color = color.silver, text_size = size.small)
+    table.cell(dash, 2, 9, sigS, text_color = color.silver, text_size = size.small)
+    table.cell(dash, 0, 10, "status", text_color = color.silver, text_size = size.small)
+    table.cell(dash, 1, 10, stageName(bullStage, buyFired),  text_color = buyFired  ? color.lime : color.silver, text_size = size.small)
+    table.cell(dash, 2, 10, stageName(bearStage, sellFired), text_color = sellFired ? color.red  : color.silver, text_size = size.small)
+
+// ------------------------- Plots & alerts ----------------------------
+plotshape(buySignal,  title = "Buy reversal",  style = shape.triangleup,   location = location.belowbar, color = color.lime, size = size.normal, text = "BUY")
+plotshape(sellSignal, title = "Sell reversal", style = shape.triangledown, location = location.abovebar, color = color.red,  size = size.normal, text = "SELL")
+
+alertcondition(buySignal,  "TheReversal Buy",  "BUY reversal confirmed: POI+Sweep+iFVG+CISD+MSS")
+alertcondition(sellSignal, "TheReversal Sell", "SELL reversal confirmed: POI+Sweep+iFVG+CISD+MSS")

@@ -280,6 +280,78 @@ swept / iFVG done / await MSS / **ENTRY SIGNAL**) ทำให้รู้ทั
 ตรรกะเหมือน MT5 ทุกขั้น (Pine ดึง POI ข้าม TF ด้วย `request.security` + `lookahead_off`
 เพื่อกัน repaint และมี dashboard เป็น `table` เช่นกัน)
 
+## TheReversal_R0 — ระบบเต็ม (POI type + zones + dashboard ครบ)
+
+`TheReversal_R0.mq5` (MT5) และ `TheReversal_R0.pine` (TradingView) คือ **เวอร์ชัน
+ระบบเต็ม** ที่จัดโครงสร้างตาม roadmap ครบทุก module — เป็นตัวต่อยอดจาก
+`POI_Reversal_Signal` โดยเพิ่ม **เลือกชนิด POI ได้**, วาด **POI เป็นโซน (box)**,
+และ **dashboard เช็กลิสต์แบบเต็ม**
+
+> **การตั้งเวอร์ชัน:** ไฟล์ลงท้าย `_R0` ทุกครั้งที่แก้ไขใหม่จะเลื่อนเป็น
+> `R1`, `R2`, ... (เช่น `TheReversal_R1.mq5`) เพื่อไล่ประวัติการพัฒนา
+
+**Module ภายใน (มี banner คั่นในโค้ด)**
+
+| # | Module | หน้าที่ |
+|---|---|---|
+| 1 | POI Manager | สร้างโซน POI จาก TF ที่เลือก ตามชนิดที่ตั้ง |
+| 2 | FVG Detector | หา Fair Value Gap ที่ทิ้งไว้ (บน entry TF) |
+| 3 | Sweep Scanner | ตรวจการกวาดสภาพคล่องที่ POI |
+| 4 | iFVG Confirm | แท่งปิดกลับทะลุ FVG (พลิกโซน) |
+| 5 | CISD Marker | จุดเปลี่ยนทิศทาง (opening range ของขาอิมพัลส์) |
+| 6 | MSS Checker | ทะลุโครงสร้าง = ทริกเกอร์ลูกศร/แจ้งเตือน |
+| 7 | Entry Planner | Entry 1=CISD, 2=iFVG, 3=OB |
+| 8 | Dashboard/UI | เช็กลิสต์ + วาดโซน POI เป็นกล่อง |
+
+**เลือกชนิด POI ได้ (`InpPOIType` / `POI type`)**
+
+| ชนิด | โซนที่ใช้เป็น POI |
+|---|---|
+| **Swing** | Swing high/low (key level / liquidity) — โซนบาง ๆ รอบ level |
+| **FVG** | Fair Value Gap ของ TF สูง |
+| **OB** | Order Block ของ TF สูง (แท่งตรงข้ามก่อนอิมพัลส์) |
+| **Fibo** | โซน retracement (ค่าเริ่มต้น 0.5–0.786 ของขาล่าสุด) |
+
+> ทั้ง MT5 และ Pine คำนวณโซนแต่ละชนิดจาก**แท่งจริงของ TF สูง** (MT5 ใช้
+> `CopyRates`, Pine คำนวณใน context ของ `request.security` + `lookahead_off`)
+> จึง**ไม่ repaint**
+
+**Dashboard (ครบตาม roadmap)** — แสดงต่อฝั่ง BULL/BEAR:
+
+```
+TheReversal R0 · POI Swing M15   BULL  BEAR
+POI Found                        YES    -
+Price In POI                     YES    -
+FVG Created                      YES    -
+Liquidity Sweep                  YES    -
+iFVG                             YES    -
+CISD                             YES    -
+MSS Confirmed                     -     -
+Entry Level                     1/2/3   -
+Signal Time                     14:35   -
+status                         awaitMSS idle
+```
+
+**พารามิเตอร์หลัก (MT5)**
+
+| พารามิเตอร์ | ค่าเริ่มต้น | ความหมาย |
+|---|---|---|
+| `InpPOITimeframe` | M15 | TF ของ POI |
+| `InpPOIType` | Swing | ชนิด POI (Swing/FVG/OB/Fibo) |
+| `InpPOIZonePoints` | 80 | ความหนาโซน (Swing/สำรอง) points |
+| `InpPOITolerancePoints` | 60 | ระยะเผื่อแตะ POI (points) |
+| `InpFibA` / `InpFibB` | 0.5 / 0.786 | ขอบโซน Fibo |
+| `InpPOIColor` | SlateBlue | สีกล่องโซน POI |
+| `InpSwingLen` / `InpLegLookback` | 3 / 12 | fractal swing / ระยะขาอิมพัลส์ |
+| `InpFVGMaxAge` / `InpMaxBars` | 40 / 30 | อายุ FVG / จำนวนแท่งต่อเฟส |
+| `InpDrawZones` / `InpDrawLevels` | true | วาดโซน / วาดเส้น entry+MSS |
+| `InpShowDashboard` / `InpDashCorner` | true / 1 | เปิด dashboard / มุม |
+| `InpAlertPopup` / `InpAlertPush` / `InpAlertEmail` | false | แจ้งเตือน ป๊อปอัป/มือถือ/อีเมล |
+
+**ติดตั้ง:** MT5 วาง `TheReversal_R0.mq5` ใน `MQL5/Indicators/` แล้ว Compile —
+TradingView วาง `TheReversal_R0.pine` ใน Pine Editor → Add to chart
+(ตั้ง Alert จากเงื่อนไข "TheReversal Buy" / "TheReversal Sell")
+
 ## ข้อควรระวัง
 
 - VWAP เดิมออกแบบสำหรับตลาดที่มี volume จริง (หุ้น/ฟิวเจอร์ส) การใช้กับ
@@ -292,3 +364,7 @@ swept / iFVG done / await MSS / **ENTRY SIGNAL**) ทำให้รู้ทั
   แบบอัตโนมัติเป็นการ**ประมาณ**การอ่านกราฟด้วยมือ ควรใช้คู่กับการยืนยันบริบท
   (HTF bias, โซนสำคัญ) และปรับ `InpSwingLen` / `InpLegLookback` ให้เข้ากับ
   TF และสินค้าที่เทรด
+- **TheReversal_R0**: การตรวจชนิด POI (OB/FVG/Fibo) เป็น**ตรรกะเชิงกฎ (rule-based)**
+  ที่ประมาณการตีความด้วยมือ — OB/FVG/Fibo แต่ละสำนักนิยามต่างกันได้ ถ้าโซนที่ระบบ
+  หาไม่ตรงใจ ให้สลับไปใช้ `POIType = Swing` (เสถียรสุด) หรือปรับ `InpPOIZonePoints`
+  / ค่า Fibo เอง เวอร์ชันถัดไป (R1+) จะค่อย ๆ ปรับให้ละเอียดขึ้นตาม feedback
