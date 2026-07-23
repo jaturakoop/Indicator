@@ -188,37 +188,81 @@ void OnTick()
 
 | ขั้น | เหตุการณ์ | เงื่อนไขในโค้ด |
 |---|---|---|
-| 1 | **POI** — ราคาวิ่งลงเข้าโซนสภาพคล่อง (swing low เดิม) | มี swing low ก่อนหน้าที่ยืนยันแล้ว (fractal); เปิด `InpUsePOIZone` เพื่อบังคับให้อยู่ในโซนที่กำหนดเองได้ |
+| 1 | **POI** — ราคาวิ่งลง**มาถึงโซนสภาพคล่องของ TF ที่กำหนด** (เช่น swing low ของ M15) | มี POI liquidity จาก `InpPOITimeframe` และ `low[i] <= poiLevel + tolerance` |
 | 2 | **FVG** — มี Bearish FVG ทิ้งไว้ระหว่างทางที่วิ่งลง | ตรวจ 3 แท่ง: `high[i] < low[i-2]` และ FVG ยังไม่ถูกทะลุ + อายุไม่เกิน `InpFVGMaxAge` |
-| 3 | **Sweep** — กวาดสภาพคล่อง (ไส้หลุดใต้ swing low แล้วปิดกลับเหนือ) | `low[i] < swingLow` **และ** `close[i] > swingLow` |
+| 3 | **Sweep** — กวาดสภาพคล่อง (ไส้หลุดใต้ POI แล้วปิดกลับเหนือ) | `low[i] < poiLevel` **และ** `close[i] > poiLevel` (ถ้าปิดต่ำกว่า = ทะลุจริง รีเซ็ต) |
 | 4 | **iFVG** — ปิดกลับ**เหนือ**โซน Bearish FVG (พลิกเป็น iFVG) | `close[i] > refFVG.top` |
 | 5 | **CISD** — ปิดเหนือ opening-range ของขาอิมพัลส์ (Change in State of Direction) | `close[i] > cisdLevel` (open สูงสุดของชุดแท่งขาลงที่ต่อเนื่องกันก่อนกวาด) |
-| 6 | **MSS** — ปิดเหนือ swing high ของชุดแท่งที่เกิด CISD (Market Structure Shift) | `close[i] > mssLevel` → **ยิงลูกศร Buy** |
+| 6 | **MSS** — ปิดเหนือ swing high ของชุดแท่งที่เกิด CISD (Market Structure Shift) | `close[i] > mssLevel` → **ยิงลูกศร + แจ้งเตือน Buy** |
 
 ฝั่งกลับตัวลง (Sell) ใช้ตรรกะสะท้อนกลับทุกข้อ (กวาด buy-side liquidity เหนือ
-swing high, Bullish FVG, ปิดต่ำกว่า iFVG/CISD/MSS)
+POI ของ TF ที่กำหนด, Bullish FVG, ปิดต่ำกว่า iFVG/CISD/MSS)
 
-**ตำแหน่งเข้าออร์เดอร์ (ข้อ 8):** เมื่อลูกศรขึ้น indicator จะวาดเส้นอ้างอิง
-3 เส้น (เปิด/ปิดด้วย `InpDrawLevels`) — **iFVG** (ฟ้า), **CISD** (ทอง),
-**MSS** (เขียว/แดง) ใช้เป็นจุดรอรีเทสต์เพื่อเข้าออร์เดอร์ตามที่อธิบายไว้
+### กำหนด Timeframe ให้ POI ได้ (MTF)
 
-**No-Repaint:** swing ยืนยันด้วย fractal ที่ต้องมีแท่งด้านขวาครบ และทุกขั้นตอน
-ประเมินจาก**แท่งที่ปิดแล้วเท่านั้น** (ข้ามแท่งกำลังวิ่ง) ลูกศรที่ขึ้นแล้วจึงไม่ขยับ/ไม่หาย
-ถ้าลำดับไม่ครบภายใน `InpMaxBars` แท่งหลังการกวาด สถานะจะรีเซ็ต (setup ตกไป)
+`InpPOITimeframe` (MT5) / `POI timeframe` (Pine) ให้เลือก TF ของ POI ได้อิสระ
+จาก TF ที่เข้าเทรด — เช่น **วางกราฟที่ M1 แต่ตั้ง POI = M15** ระบบจะดึง swing
+high/low ของ M15 มาเป็นโซนสภาพคล่อง เมื่อราคา M1 วิ่งมาถึงโซน M15 แล้ว state
+machine จะเริ่มไล่เงื่อนไขข้อ 1→6 บนกราฟ M1 (ตั้งเป็น `PERIOD_CURRENT` = ใช้ TF
+เดียวกับกราฟ) การดึง POI ข้าม TF ใช้เวลาปิดแท่งของ TF สูงกว่า → **ไม่ repaint**
+
+### ตำแหน่งเข้าออร์เดอร์ (Entry Levels) + ลูกศร
+
+- **ลูกศร + แจ้งเตือน** เกิดที่ **MSS (trigger)** — จุดที่ยืนยันการกลับตัวสมบูรณ์
+- **จุดเข้าจริง** คือเส้นรอรีเทสต์ 3 ระดับ (มีป้ายกำกับชัดเจนบนกราฟ):
+
+| เส้น | ชื่อป้าย | ความหมาย |
+|---|---|---|
+| 🟠 ทอง | **Entry 1: CISD** | opening-range ของขาอิมพัลส์ (เข้าไว/ตื้นสุด) |
+| 🔵 ฟ้า | **Entry 2: iFVG** | โซน FVG ที่ถูกพลิก (กลาง) |
+| 🟣 ม่วง | **Entry 3: OB** | order block ต้นกำเนิดการกวาด (ลึกสุด/ conservative) |
+| 🔷 น้ำเงิน | **POI (TF)** | เส้นโซนสภาพคล่องของ TF ที่กำหนด |
+| 🟩 เขียว/🟥 แดง | **MSS (trigger)** | จุดยืนยัน = ที่ลูกศรออก |
+
+เส้นทั้งหมดมี**ป้ายชื่อกำกับ**ทุกเส้น (เปิด/ปิดด้วย `InpDrawLevels`) และจะโชว์
+ทั้งของ setup ที่ **ยืนยันแล้ว** (ค้างบนกราฟ) และ setup ที่ **กำลังก่อตัว** (live)
+
+### Dashboard บอกสถานะ
+
+เปิดด้วย `InpShowDashboard` (MT5) / `Show the status dashboard` (Pine) — แสดงตาราง
+เช็กลิสต์แบบ real-time ว่าตอนนี้แต่ละฝั่ง (BULL / BEAR) เกิดครบขั้นไหนแล้ว:
+
+```
+POI Reversal  |  POI TF: M15
+step          BULL   BEAR
+1 POI         [x]    [ ]
+2 FVG         [x]    [ ]
+3 Sweep       [x]    [ ]
+4 iFVG        [x]    [ ]
+5 CISD        [x]    [ ]
+6 MSS/Entry   [ ]    [ ]
+BULL: await MSS   BEAR: idle
+```
+
+`[x]` = ผ่านแล้ว, `[ ]` = ยังไม่ถึง — บรรทัดล่างบอกสถานะปัจจุบัน (idle / at POI /
+swept / iFVG done / await MSS / **ENTRY SIGNAL**) ทำให้รู้ทันทีว่า**ครบเงื่อนไข
+เข้าออร์เดอร์แล้วหรือยัง**
+
+**No-Repaint:** POI (MTF) ใช้เวลาปิดแท่งของ TF สูงกว่า และทุกขั้นตอนประเมินจาก
+**แท่งที่ปิดแล้วเท่านั้น** ลูกศรที่ขึ้นแล้วจึงไม่ขยับ/ไม่หาย ถ้าลำดับไม่ครบภายใน
+`InpMaxBars` แท่ง (นับต่อเฟส) สถานะจะรีเซ็ต (setup ตกไป)
 
 **พารามิเตอร์สำคัญ (MT5)**
 
 | พารามิเตอร์ | ค่าเริ่มต้น | ความหมาย |
 |---|---|---|
+| `InpPOITimeframe` | PERIOD_CURRENT | **TF ของ POI** (เช่น PERIOD_M15 ขณะเทรด M1) |
+| `InpPOITolerancePoints` | 60 | ระยะเผื่อ "แตะ" POI (points) |
 | `InpSwingLen` | 3 | ความยาว fractal ของ swing (แท่งซ้าย/ขวาข้างละ) |
-| `InpLegLookback` | 12 | ระยะมองย้อนหาขาอิมพัลส์สำหรับ CISD/MSS (แท่ง) |
+| `InpLegLookback` | 12 | ระยะมองย้อนหาขาอิมพัลส์สำหรับ CISD/OB (แท่ง) |
 | `InpFVGMaxAge` | 40 | อายุสูงสุดของ FVG ที่ทิ้งไว้ ณ จุดกวาด (แท่ง) |
-| `InpUsePOIZone` | false | บังคับให้จุดกวาดต้องอยู่ในโซน POI ที่กำหนดเอง |
-| `InpPOIUpper` / `InpPOILower` | 0 / 0 | ราคาบน/ล่างของโซน POI (ใช้เมื่อเปิด `InpUsePOIZone`) |
-| `InpMaxBars` | 30 | จำนวนแท่งสูงสุดจากกวาดถึง MSS ก่อนรีเซ็ต |
+| `InpMaxBars` | 30 | จำนวนแท่งสูงสุดต่อเฟสก่อนรีเซ็ต |
+| `InpDrawLevels` | true | วาดเส้น POI / Entry 1-3 / MSS พร้อมป้ายกำกับ |
+| `InpLevelExtendBars` | 12 | ความยาวเส้นที่ยื่นไปทางขวา (แท่ง) |
+| `InpShowDashboard` | true | แสดง dashboard สถานะ |
+| `InpDashCorner` | 1 | มุมของ dashboard (0=บนซ้าย 1=บนขวา 2=ล่างซ้าย 3=ล่างขวา) |
+| `InpDashFontSize` | 9 | ขนาดฟอนต์ dashboard/ป้าย |
 | `InpArrowOffsetPoints` | 150 | ระยะลูกศรห่างจากแท่ง (points) |
-| `InpDrawLevels` | true | วาดเส้นอ้างอิง iFVG / CISD / MSS |
-| `InpLevelExtendBars` | 12 | ความยาวเส้นอ้างอิงที่ยื่นไปทางขวา (แท่ง) |
 | `InpAlertPopup` / `InpAlertPush` | false | แจ้งเตือนป๊อปอัป / มือถือ |
 
 **Buffer สำหรับต่อยอดใน EA**
@@ -228,12 +272,13 @@ swing high, Bullish FVG, ปิดต่ำกว่า iFVG/CISD/MSS)
 | 0 | Buy arrow (มีค่า = ยืนยันกลับตัวขึ้นที่แท่งนั้น) |
 | 1 | Sell arrow |
 
-> ตัวนี้ **ไม่พึ่ง** `VWAP.ex5` หรือ indicator อื่น — คำนวณ FVG/swing/สภาพคล่อง
+> ตัวนี้ **ไม่พึ่ง** `VWAP.ex5` หรือ indicator อื่น — คำนวณ FVG/สภาพคล่อง/POI
 > จาก OHLC โดยตรง วางไฟล์ `POI_Reversal_Signal.mq5` ใน `MQL5/Indicators/` แล้วคอมไพล์
 
 **เวอร์ชัน TradingView:** เปิด Pine Editor วางเนื้อหา `POI_Reversal_Signal.pine`
 → Save → Add to chart ตั้ง Alert ได้จากเงื่อนไข "POI Buy reversal" / "POI Sell reversal"
-ตรรกะเหมือน MT5 ทุกขั้น (Pine ใช้ `ta.pivothigh/low` ยืนยัน swing แบบ non-repaint)
+ตรรกะเหมือน MT5 ทุกขั้น (Pine ดึง POI ข้าม TF ด้วย `request.security` + `lookahead_off`
+เพื่อกัน repaint และมี dashboard เป็น `table` เช่นกัน)
 
 ## ข้อควรระวัง
 

@@ -3,29 +3,30 @@
 //|     POI + Sweep Liquidity + iFVG + CISD + MSS reversal model      |
 //|                                                                  |
 //|  A high-quality reversal is confirmed only when this ordered      |
-//|  cascade completes inside a Point-of-Interest zone:               |
+//|  cascade completes at a Point-of-Interest:                        |
 //|                                                                  |
-//|   1. POI      : price trades into a swing-liquidity level         |
-//|                 (optionally gated to a manual price zone).         |
-//|   2. FVG      : a Fair Value Gap is left behind on the way in.     |
-//|   3. Sweep    : that liquidity is swept (wick beyond, close back). |
-//|   4. iFVG     : price closes back through the left-behind FVG      |
-//|                 (the FVG is inverted -> support/resistance flip).  |
-//|   5. CISD     : Change In State of Direction — close beyond the    |
-//|                 opening range of the final impulse leg.            |
-//|   6. MSS      : Market Structure Shift — close beyond the swing    |
-//|                 high/low of the candle set that produced CISD.     |
+//|   1. POI    : price reaches a liquidity level, taken from a       |
+//|               selectable timeframe (e.g. mark POI on M15 while     |
+//|               entering on M1).                                    |
+//|   2. FVG    : a Fair Value Gap is left behind on the way in.      |
+//|   3. Sweep  : that liquidity is swept (wick beyond, close back).  |
+//|   4. iFVG   : price closes back through the left-behind FVG.      |
+//|   5. CISD   : Change In State of Direction — close beyond the     |
+//|               opening range of the final impulse leg.             |
+//|   6. MSS    : Market Structure Shift — close beyond the swing     |
+//|               high/low of the candle set that produced CISD.      |
 //|                                                                  |
-//|  Only when 1->6 complete in order is an arrow printed.            |
+//|  An arrow prints only when 1->6 complete in order. Every level    |
+//|  (POI / iFVG / CISD / MSS) is drawn as a labelled line, and a     |
+//|  dashboard shows the live progress of each side.                  |
 //|                                                                  |
-//|  No-Repaint: swings are confirmed with a right-hand offset and     |
-//|  every stage is evaluated on CLOSED bars, so a printed arrow       |
-//|  never moves or vanishes. Levels for entry (iFVG / CISD / MSS)     |
-//|  are drawn as reference lines when the signal fires.               |
+//|  No-Repaint: swings are confirmed with a right-hand offset and    |
+//|  every stage is evaluated on CLOSED bars, so a printed arrow      |
+//|  never moves or vanishes.                                        |
 //+------------------------------------------------------------------+
 #property copyright "Indicator"
-#property version   "1.00"
-#property description "POI + Sweep Liquidity + iFVG + CISD + MSS reversal confirmation. No-repaint arrows."
+#property version   "2.00"
+#property description "POI(MTF) + Sweep + iFVG + CISD + MSS reversal confirmation with labels & dashboard."
 
 #property indicator_chart_window
 #property indicator_buffers 2
@@ -46,27 +47,34 @@
 //+------------------------------------------------------------------+
 //| Inputs                                                           |
 //+------------------------------------------------------------------+
+input group "=== POI (Point of Interest) — multi-timeframe ==="
+input ENUM_TIMEFRAMES InpPOITimeframe = PERIOD_CURRENT; // POI timeframe (e.g. M15 while entering on M1)
+input double InpPOITolerancePoints = 60.0; // POI touch tolerance (points)
+
 input group "=== Swing / liquidity detection ==="
-input int    InpSwingLen   = 3;    // Fractal swing length (bars each side)
+input int    InpSwingLen    = 3;   // Fractal swing length (bars each side)
 input int    InpLegLookback = 12;  // Impulse-leg lookback for CISD/MSS (bars)
 
 input group "=== FVG (Fair Value Gap) ==="
-input int    InpFVGMaxAge  = 40;   // Max age of the left-behind FVG at sweep (bars)
-
-input group "=== Point of Interest gate (optional manual zone) ==="
-input bool   InpUsePOIZone = false; // Only accept sweeps inside a manual zone
-input double InpPOIUpper   = 0.0;   // POI zone upper price
-input double InpPOILower   = 0.0;   // POI zone lower price
+input int    InpFVGMaxAge   = 40;  // Max age of the left-behind FVG at sweep (bars)
 
 input group "=== Sequence timing ==="
-input int    InpMaxBars    = 30;    // Max bars from sweep to MSS before reset
+input int    InpMaxBars     = 30;  // Max bars per phase before the setup resets
+
+input group "=== Level lines ==="
+input bool   InpDrawLevels  = true; // Draw labelled POI / iFVG / CISD / MSS lines
+input int    InpLevelExtendBars = 12; // How far right to extend level lines (bars)
+
+input group "=== Dashboard ==="
+input bool   InpShowDashboard = true; // Show the status dashboard
+input int    InpDashCorner   = 1;   // 0=TopLeft 1=TopRight 2=BottomLeft 3=BottomRight
+input int    InpDashFontSize = 9;    // Dashboard / label font size
+input color  InpDashText     = clrGainsboro; // Dashboard text colour
 
 input group "=== Signal display ==="
 input int    InpArrowOffsetPoints = 150; // Arrow distance from candle (points)
-input bool   InpDrawLevels = true;  // Draw iFVG / CISD / MSS reference lines
-input int    InpLevelExtendBars = 12; // How far right to extend level lines (bars)
-input bool   InpAlertPopup = false; // Popup alert on new confirmed reversal
-input bool   InpAlertPush  = false; // Push notification on new confirmed reversal
+input bool   InpAlertPopup  = false; // Popup alert on new confirmed reversal
+input bool   InpAlertPush   = false; // Push notification on new confirmed reversal
 
 //+------------------------------------------------------------------+
 //| Buffers                                                          |
@@ -78,25 +86,38 @@ double SellBuffer[];
 double O[], H[], L[], C[];
 datetime T[];
 
+//--- POI swing levels pulled from the POI timeframe (with confirm times)
+double   PoiLowP[];  datetime PoiLowT[];
+double   PoiHighP[]; datetime PoiHighT[];
+
 //--- Stage constants for the reversal state machine
-#define ST_IDLE   0
-#define ST_SWEPT  1   // liquidity swept inside POI, FVG referenced
-#define ST_IFVG   2   // price closed back through the left-behind FVG
-#define ST_CISD   3   // change in state of direction confirmed
+#define ST_IDLE  0
+#define ST_POI   1   // price reached the POI, a valid FVG is on record
+#define ST_SWEPT 2   // liquidity swept inside the POI
+#define ST_IFVG  3   // price closed back through the left-behind FVG
+#define ST_CISD  4   // change in state of direction confirmed
 
 //--- One reversal setup (bullish or bearish share the same struct)
 struct Setup
   {
-   int    stage;        // ST_*
-   int    sweepBar;     // bar index of the sweep
+   int    stage;
+   int    poiBar;       // bar where the POI was first reached
+   double poiLevel;     // the POI liquidity level being tracked
+   int    sweepBar;     // bar of the sweep
    double refFVGTop;    // left-behind FVG top / bottom (the level to invert)
    double refFVGBot;
-   double cisdLevel;    // opening-range level of the final impulse leg
-   double ifvgLevel;    // recorded iFVG price (for entry reference)
-   double mssLevel;     // swing high/low that must break for MSS
+   double cisdLevel;    // Entry 1 — opening-range level of the impulse leg
+   double ifvgLevel;    // Entry 2 — the inverted FVG (iFVG)
+   double obLevel;      // Entry 3 — order block (origin candle of the sweep)
+   double mssLevel;     // MSS trigger — swing high/low that must break
+   double runExtreme;   // running high (bull) / low (bear) since the sweep
   };
 
 Setup Bull, Bear;
+
+//--- Last confirmed signals (for the dashboard)
+datetime LastBuyTime  = 0;
+datetime LastSellTime = 0;
 
 //--- Recompute guard: only rebuild once per newly closed bar
 int LastCalcBars = 0;
@@ -125,7 +146,7 @@ int OnInit()
   }
 
 //+------------------------------------------------------------------+
-//| Deinit — clean up our reference-line objects                     |
+//| Deinit — clean up our objects                                    |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
   {
@@ -133,25 +154,14 @@ void OnDeinit(const int reason)
   }
 
 //+------------------------------------------------------------------+
-//| Fractal swing test on a fully-formed pivot bar p                 |
-//|   needs InpSwingLen bars on each side (p must be <= last-Len)     |
+//| Short timeframe name (e.g. "M15") for labels                     |
 //+------------------------------------------------------------------+
-bool IsSwingHigh(const int p, const int len)
+string TFName(const ENUM_TIMEFRAMES tf)
   {
-   if(p - len < 0) return(false);
-   double v = H[p];
-   for(int k = 1; k <= len; k++)
-      if(H[p-k] > v || H[p+k] > v) return(false);
-   return(true);
-  }
-
-bool IsSwingLow(const int p, const int len)
-  {
-   if(p - len < 0) return(false);
-   double v = L[p];
-   for(int k = 1; k <= len; k++)
-      if(L[p-k] < v || L[p+k] < v) return(false);
-   return(true);
+   string s = EnumToString(tf);
+   int pos = StringFind(s, "PERIOD_");
+   if(pos == 0) s = StringSubstr(s, 7);
+   return(s);
   }
 
 //+------------------------------------------------------------------+
@@ -159,35 +169,90 @@ bool IsSwingLow(const int p, const int len)
 //+------------------------------------------------------------------+
 void ResetSetup(Setup &s)
   {
-   s.stage     = ST_IDLE;
-   s.sweepBar  = -1;
-   s.refFVGTop = 0.0;
-   s.refFVGBot = 0.0;
-   s.cisdLevel = 0.0;
-   s.ifvgLevel = 0.0;
-   s.mssLevel  = 0.0;
+   s.stage      = ST_IDLE;
+   s.poiBar     = -1;
+   s.poiLevel   = 0.0;
+   s.sweepBar   = -1;
+   s.refFVGTop  = 0.0;
+   s.refFVGBot  = 0.0;
+   s.cisdLevel  = 0.0;
+   s.ifvgLevel  = 0.0;
+   s.obLevel    = 0.0;
+   s.mssLevel   = 0.0;
+   s.runExtreme = 0.0;
   }
 
 //+------------------------------------------------------------------+
-//| POI gate: is the sweep extreme allowed by the manual zone?       |
+//| Order-block level = origin candle of the sweep (deepest retest)   |
+//|   bull: high of the lowest-low candle of the leg into the sweep    |
+//|   bear: low  of the highest-high candle of the leg into the sweep  |
 //+------------------------------------------------------------------+
-bool InPOIZone(const double price)
+double BullOB(const int b)
   {
-   if(!InpUsePOIZone) return(true);
-   double hi = MathMax(InpPOIUpper, InpPOILower);
-   double lo = MathMin(InpPOIUpper, InpPOILower);
-   return(price >= lo && price <= hi);
+   int lowBar = b;
+   for(int k = b; k >= 1 && k > b - InpLegLookback - 1; k--)
+      if(L[k] < L[lowBar]) lowBar = k;
+   return(H[lowBar]);
+  }
+
+double BearOB(const int b)
+  {
+   int highBar = b;
+   for(int k = b; k >= 1 && k > b - InpLegLookback - 1; k--)
+      if(H[k] > H[highBar]) highBar = k;
+   return(L[highBar]);
   }
 
 //+------------------------------------------------------------------+
-//| CISD opening-range level of the down-leg that made the low at b  |
-//|   = highest OPEN among the consecutive bearish candles into b     |
+//| Build POI swing levels from the POI timeframe                    |
+//|   Confirmation time = close of the bar that completes the pivot, |
+//|   so on the chart TF a level is only used once it cannot repaint. |
+//+------------------------------------------------------------------+
+void BuildPOISwings(const datetime t_from, const datetime t_to)
+  {
+   ArrayResize(PoiLowP, 0);  ArrayResize(PoiLowT, 0);
+   ArrayResize(PoiHighP, 0); ArrayResize(PoiHighT, 0);
+
+   ENUM_TIMEFRAMES tf = (InpPOITimeframe == PERIOD_CURRENT) ? (ENUM_TIMEFRAMES)_Period : InpPOITimeframe;
+   int secs = PeriodSeconds(tf);
+   int len  = InpSwingLen;
+
+   MqlRates r[];
+   ArraySetAsSeries(r, false);
+   int n = CopyRates(_Symbol, tf, t_from - (datetime)(secs * (len + 2)), t_to, r);
+   if(n < 2 * len + 1)
+      return;
+
+   for(int j = len; j <= n - len - 1; j++)
+     {
+      bool sh = true, sl = true;
+      for(int k = 1; k <= len; k++)
+        {
+         if(r[j-k].high > r[j].high || r[j+k].high > r[j].high) sh = false;
+         if(r[j-k].low  < r[j].low  || r[j+k].low  < r[j].low ) sl = false;
+        }
+      datetime conf = (datetime)(r[j+len].time + secs); // pivot confirmed at this close
+      if(sh)
+        {
+         int s = ArraySize(PoiHighP);
+         ArrayResize(PoiHighP, s+1); ArrayResize(PoiHighT, s+1);
+         PoiHighP[s] = r[j].high; PoiHighT[s] = conf;
+        }
+      if(sl)
+        {
+         int s = ArraySize(PoiLowP);
+         ArrayResize(PoiLowP, s+1); ArrayResize(PoiLowT, s+1);
+         PoiLowP[s] = r[j].low; PoiLowT[s] = conf;
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| CISD opening-range level of the down-leg into sweep bar b        |
+//|   = highest OPEN of the consecutive bearish candles of the leg    |
 //+------------------------------------------------------------------+
 double DownLegCISD(const int b)
   {
-   // highest OPEN of the consecutive bearish candles of the leg into the
-   // sweep bar b. The sweep bar itself may close back up, so we skip
-   // leading non-bearish candles and start the run at the first bearish one.
    double lvl = O[b];
    bool started = false;
    for(int k = b; k >= 1 && k > b - InpLegLookback - 1; k--)
@@ -201,12 +266,10 @@ double DownLegCISD(const int b)
   }
 
 //+------------------------------------------------------------------+
-//| CISD opening-range level of the up-leg that made the high at b   |
-//|   = lowest OPEN among the consecutive bullish candles into b      |
+//| CISD opening-range level of the up-leg into sweep bar b          |
 //+------------------------------------------------------------------+
 double UpLegCISD(const int b)
   {
-   // lowest OPEN of the consecutive bullish candles of the leg into sweep bar b
    double lvl = O[b];
    bool started = false;
    for(int k = b; k >= 1 && k > b - InpLegLookback - 1; k--)
@@ -220,26 +283,126 @@ double UpLegCISD(const int b)
   }
 
 //+------------------------------------------------------------------+
-//| Draw an entry-reference line + label for a confirmed reversal    |
+//| Draw a labelled horizontal segment (line + text tag)             |
 //+------------------------------------------------------------------+
-void DrawLevel(const string tag, const datetime t0, const int barIdx,
-               const double price, const color col, const int rt)
+void DrawTaggedLine(const string id, const string text,
+                    const datetime t0, const datetime t1,
+                    const double price, const color col)
   {
    if(!InpDrawLevels) return;
-   int endIdx = MathMin(barIdx + InpLevelExtendBars, rt - 1);
-   string name = "POIrev_" + tag + "_" + (string)(long)t0;
+
+   string ln = "POIrev_" + id;
+   if(ObjectFind(0, ln) < 0)
+      ObjectCreate(0, ln, OBJ_TREND, 0, t0, price, t1, price);
+   ObjectSetInteger(0, ln, OBJPROP_TIME,  0, t0);
+   ObjectSetDouble (0, ln, OBJPROP_PRICE, 0, price);
+   ObjectSetInteger(0, ln, OBJPROP_TIME,  1, t1);
+   ObjectSetDouble (0, ln, OBJPROP_PRICE, 1, price);
+   ObjectSetInteger(0, ln, OBJPROP_COLOR, col);
+   ObjectSetInteger(0, ln, OBJPROP_STYLE, STYLE_DOT);
+   ObjectSetInteger(0, ln, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, ln, OBJPROP_RAY_RIGHT, false);
+   ObjectSetInteger(0, ln, OBJPROP_BACK, true);
+   ObjectSetInteger(0, ln, OBJPROP_SELECTABLE, false);
+
+   string tx = "POIrev_" + id + "_t";
+   if(ObjectFind(0, tx) < 0)
+      ObjectCreate(0, tx, OBJ_TEXT, 0, t0, price);
+   ObjectSetInteger(0, tx, OBJPROP_TIME,  0, t0);
+   ObjectSetDouble (0, tx, OBJPROP_PRICE, 0, price);
+   ObjectSetString (0, tx, OBJPROP_TEXT, " " + text);
+   ObjectSetInteger(0, tx, OBJPROP_COLOR, col);
+   ObjectSetInteger(0, tx, OBJPROP_FONTSIZE, InpDashFontSize);
+   ObjectSetInteger(0, tx, OBJPROP_ANCHOR, ANCHOR_LEFT_LOWER);
+   ObjectSetInteger(0, tx, OBJPROP_SELECTABLE, false);
+  }
+
+//+------------------------------------------------------------------+
+//| Draw the full labelled level set for one confirmed side          |
+//+------------------------------------------------------------------+
+void DrawSet(const string sig, const Setup &s, const bool is_buy,
+             const int endIdx, const ENUM_TIMEFRAMES tf)
+  {
+   datetime t1 = T[endIdx];
+   color poiCol  = clrDodgerBlue;
+   color cisdCol = clrGold;        // Entry 1
+   color ifvgCol = clrDeepSkyBlue; // Entry 2
+   color obCol   = clrMediumOrchid;// Entry 3
+   color mssCol  = is_buy ? clrLime : clrOrangeRed;
+
+   int pb = (s.poiBar  >= 0) ? s.poiBar  : s.sweepBar;
+   int sb = (s.sweepBar >= 0) ? s.sweepBar : pb;
+
+   DrawTaggedLine(sig + "_POI",  "POI " + TFName(tf),  T[pb], t1, s.poiLevel,  poiCol);
+   DrawTaggedLine(sig + "_MSS",  "MSS (trigger)",      T[sb], t1, s.mssLevel,  mssCol);
+   DrawTaggedLine(sig + "_E1",   "Entry 1: CISD",      T[sb], t1, s.cisdLevel, cisdCol);
+   DrawTaggedLine(sig + "_E2",   "Entry 2: iFVG",      T[sb], t1, s.ifvgLevel, ifvgCol);
+   DrawTaggedLine(sig + "_E3",   "Entry 3: OB",        T[sb], t1, s.obLevel,   obCol);
+  }
+
+//+------------------------------------------------------------------+
+//| Dashboard                                                        |
+//+------------------------------------------------------------------+
+string Tick(const int stage, const int need) { return (stage >= need ? "[x]" : "[ ]"); }
+
+string StageName(const int stage, const bool fired)
+  {
+   if(fired)            return("ENTRY SIGNAL");
+   switch(stage)
+     {
+      case ST_POI:   return("at POI");
+      case ST_SWEPT: return("swept");
+      case ST_IFVG:  return("iFVG done");
+      case ST_CISD:  return("await MSS");
+     }
+   return("idle");
+  }
+
+void DashLine(const int row, const string text, const color col,
+              const int corner, const int x0, const int y0, const int dy)
+  {
+   // Right-hand corners must anchor the text on its right edge, otherwise
+   // the panel is drawn off the right side of the chart.
+   bool isRight = (corner == CORNER_RIGHT_UPPER || corner == CORNER_RIGHT_LOWER);
+   ENUM_ANCHOR_POINT anchor = isRight ? ANCHOR_RIGHT_UPPER : ANCHOR_LEFT_UPPER;
+
+   string name = "POIrev_dash_" + (string)row;
    if(ObjectFind(0, name) < 0)
-      ObjectCreate(0, name, OBJ_TREND, 0, t0, price, T[endIdx], price);
-   ObjectSetInteger(0, name, OBJPROP_TIME, 0, t0);
-   ObjectSetDouble (0, name, OBJPROP_PRICE, 0, price);
-   ObjectSetInteger(0, name, OBJPROP_TIME, 1, T[endIdx]);
-   ObjectSetDouble (0, name, OBJPROP_PRICE, 1, price);
+      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, corner);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR, anchor);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x0);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y0 + row * dy);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, InpDashFontSize);
+   ObjectSetString (0, name, OBJPROP_FONT, "Consolas");
    ObjectSetInteger(0, name, OBJPROP_COLOR, col);
-   ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_DOT);
-   ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
-   ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, false);
-   ObjectSetInteger(0, name, OBJPROP_BACK, true);
-   ObjectSetString (0, name, OBJPROP_TOOLTIP, tag);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetString (0, name, OBJPROP_TEXT, text);
+  }
+
+void DrawDashboard(const ENUM_TIMEFRAMES tf, const bool buyFired, const bool sellFired)
+  {
+   if(!InpShowDashboard) return;
+
+   int corner = InpDashCorner; // 0..3 map directly to CORNER_* enum
+   int x0 = 12;
+   int y0 = 18;
+   int dy = InpDashFontSize + 8;
+
+   int bs = Bull.stage, es = Bear.stage;
+   color hdr = clrWhite, tc = InpDashText;
+
+   DashLine(0, "POI Reversal  |  POI TF: " + TFName(tf),                 hdr, corner, x0, y0, dy);
+   DashLine(1, "step          BULL   BEAR",                              tc,  corner, x0, y0, dy);
+   DashLine(2, "1 POI         " + Tick(bs,ST_POI)   + "   " + Tick(es,ST_POI),   (bs>=ST_POI  ||es>=ST_POI )?clrAqua:tc, corner, x0, y0, dy);
+   DashLine(3, "2 FVG         " + Tick(bs,ST_POI)   + "   " + Tick(es,ST_POI),   (bs>=ST_POI  ||es>=ST_POI )?clrAqua:tc, corner, x0, y0, dy);
+   DashLine(4, "3 Sweep       " + Tick(bs,ST_SWEPT) + "   " + Tick(es,ST_SWEPT), (bs>=ST_SWEPT||es>=ST_SWEPT)?clrAqua:tc, corner, x0, y0, dy);
+   DashLine(5, "4 iFVG        " + Tick(bs,ST_IFVG)  + "   " + Tick(es,ST_IFVG),  (bs>=ST_IFVG ||es>=ST_IFVG )?clrAqua:tc, corner, x0, y0, dy);
+   DashLine(6, "5 CISD        " + Tick(bs,ST_CISD)  + "   " + Tick(es,ST_CISD),  (bs>=ST_CISD ||es>=ST_CISD )?clrAqua:tc, corner, x0, y0, dy);
+   DashLine(7, "6 MSS/Entry   " + (buyFired?"[x]":"[ ]") + "   " + (sellFired?"[x]":"[ ]"),
+                                                                          (buyFired||sellFired)?clrYellow:tc, corner, x0, y0, dy);
+   DashLine(8, "BULL: " + StageName(bs, buyFired) + "   BEAR: " + StageName(es, sellFired),
+               (buyFired?clrLime:(sellFired?clrOrangeRed:tc)), corner, x0, y0, dy);
   }
 
 //+------------------------------------------------------------------+
@@ -276,7 +439,10 @@ int OnCalculate(const int rates_total,
       O[i] = open[i];  H[i] = high[i];  L[i] = low[i];  C[i] = close[i];  T[i] = time[i];
      }
 
-//--- Full rebuild: clear buffers and objects, replay the state machine.
+   ENUM_TIMEFRAMES poiTF = (InpPOITimeframe == PERIOD_CURRENT) ? (ENUM_TIMEFRAMES)_Period : InpPOITimeframe;
+   BuildPOISwings(T[0], T[rates_total - 1]);
+
+//--- Full rebuild: clear buffers/objects, replay the state machine.
    ArrayInitialize(BuyBuffer,  0.0);
    ArrayInitialize(SellBuffer, 0.0);
    ObjectsDeleteAll(0, "POIrev_");
@@ -284,130 +450,153 @@ int OnCalculate(const int rates_total,
    ResetSetup(Bear);
 
    double offset = InpArrowOffsetPoints * _Point;
+   double tol    = InpPOITolerancePoints * _Point;
 
 //--- Running references maintained as bars stream in (left -> right).
-   double lastBearTop = 0.0, lastBearBot = 0.0; int lastBearBar = -1; // most recent unbroken bearish FVG
-   double lastBullTop = 0.0, lastBullBot = 0.0; int lastBullBar = -1; // most recent unbroken bullish FVG
-   double prevSwingHigh = 0.0; int prevSwingHighBar = -1;             // last confirmed swing high
-   double prevSwingLow  = 0.0; int prevSwingLowBar  = -1;             // last confirmed swing low
+   double lastBearTop = 0.0, lastBearBot = 0.0; int lastBearBar = -1;
+   double lastBullTop = 0.0, lastBullBot = 0.0; int lastBullBar = -1;
 
-//--- Process CLOSED bars only. The forming bar is rates_total-1 -> skip.
-   int last_closed = rates_total - 2;
+//--- POI level cursors (advance as their confirm time passes)
+   int    loIdx = -1, hiIdx = -1;
+   double poiLow = 0.0, poiHigh = 0.0;
+   bool   havePoiLow = false, havePoiHigh = false;
+
+   bool buyFired = false, sellFired = false;
+   int  last_closed = rates_total - 2;
 
    for(int i = 2; i <= last_closed; i++)
      {
       //=== (a) Update the most recent unbroken FVGs =================
-      //   Bearish FVG at i: high[i] < low[i-2]  (gap down, left on the way down)
       if(H[i] < L[i-2])
         { lastBearTop = L[i-2]; lastBearBot = H[i]; lastBearBar = i; }
-      //   Bullish FVG at i: low[i] > high[i-2]  (gap up, left on the way up)
       if(L[i] > H[i-2])
         { lastBullTop = L[i]; lastBullBot = H[i-2]; lastBullBar = i; }
-      //   A close beyond an FVG (on a later bar) means it has already been
-      //   traded through, so it is no longer a valid "left-behind" gap.
-      //   Skip while a setup is holding it as its reference to invert.
       if(lastBearBar >= 0 && i > lastBearBar && C[i] > lastBearTop && Bull.stage == ST_IDLE)
          lastBearBar = -1;
       if(lastBullBar >= 0 && i > lastBullBar && C[i] < lastBullBot && Bear.stage == ST_IDLE)
          lastBullBar = -1;
 
-      //=== (b) Confirm swing pivots at bar i-InpSwingLen ============
-      int p = i - InpSwingLen;
-      if(p >= InpSwingLen)
-        {
-         if(IsSwingHigh(p, InpSwingLen)) { prevSwingHigh = H[p]; prevSwingHighBar = p; }
-         if(IsSwingLow (p, InpSwingLen)) { prevSwingLow  = L[p]; prevSwingLowBar  = p; }
-        }
+      //=== (b) Advance the POI liquidity levels for this bar ========
+      while(loIdx + 1 < ArraySize(PoiLowT)  && PoiLowT[loIdx+1]  <= T[i]) { loIdx++; poiLow  = PoiLowP[loIdx];  havePoiLow  = true; }
+      while(hiIdx + 1 < ArraySize(PoiHighT) && PoiHighT[hiIdx+1] <= T[i]) { hiIdx++; poiHigh = PoiHighP[hiIdx]; havePoiHigh = true; }
 
       //=== (c) BULLISH reversal machine ============================
-      //   Timeout
-      if(Bull.stage != ST_IDLE && i - Bull.sweepBar > InpMaxBars)
-         ResetSetup(Bull);
+      if(Bull.stage == ST_POI   && i - Bull.poiBar   > InpMaxBars) ResetSetup(Bull);
+      if(Bull.stage >= ST_SWEPT && i - Bull.sweepBar > InpMaxBars) ResetSetup(Bull);
 
-      //   Stage 1+2+3: sell-side liquidity sweep at a prior swing low,
-      //   with a bearish FVG left behind on the way down.
-      if(Bull.stage == ST_IDLE)
+      //   1+2: price reaches the POI with a bearish FVG left behind.
+      if(Bull.stage == ST_IDLE && havePoiLow)
         {
-         bool sweep = (prevSwingLowBar >= 0 && prevSwingLowBar < i &&
-                       L[i] < prevSwingLow && C[i] > prevSwingLow);
-         bool fvgOk = (lastBearBar >= 0 && (i - lastBearBar) <= InpFVGMaxAge &&
-                       lastBearTop > L[i]);
-         if(sweep && fvgOk && InPOIZone(L[i]))
+         bool fvgOk = (lastBearBar >= 0 && (i - lastBearBar) <= InpFVGMaxAge && lastBearTop > poiLow);
+         if(L[i] <= poiLow + tol && fvgOk)
            {
-            Bull.stage     = ST_SWEPT;
-            Bull.sweepBar  = i;
+            Bull.stage    = ST_POI;
+            Bull.poiBar   = i;
+            Bull.poiLevel = poiLow;
             Bull.refFVGTop = lastBearTop;
             Bull.refFVGBot = lastBearBot;
-            Bull.cisdLevel = DownLegCISD(i);
            }
         }
-      //   Stage 4: iFVG — close back above the left-behind bearish FVG.
+      //   3: sweep — wick below the POI then close back above it.
+      if(Bull.stage == ST_POI && L[i] < Bull.poiLevel)
+        {
+         if(C[i] > Bull.poiLevel)
+           {
+            Bull.stage      = ST_SWEPT;
+            Bull.sweepBar   = i;
+            Bull.cisdLevel  = DownLegCISD(i);
+            Bull.obLevel    = BullOB(i);
+            Bull.runExtreme = H[i];
+           }
+         else
+            ResetSetup(Bull); // closed through the POI = level broke, no sweep
+        }
+      //   track the swing high of the candle set built since the sweep
+      if(Bull.stage == ST_SWEPT || Bull.stage == ST_IFVG)
+         if(H[i] > Bull.runExtreme) Bull.runExtreme = H[i];
+      //   4: iFVG — close back above the left-behind bearish FVG.
       if(Bull.stage == ST_SWEPT && C[i] > Bull.refFVGTop)
-        {
-         Bull.stage     = ST_IFVG;
-         Bull.ifvgLevel = Bull.refFVGTop;
-        }
-      //   Stage 5: CISD — close above the impulse opening-range level.
+        { Bull.stage = ST_IFVG; Bull.ifvgLevel = Bull.refFVGTop; }
+      //   5: CISD — close above the impulse opening range.
       if(Bull.stage == ST_IFVG && C[i] > Bull.cisdLevel)
-        {
-         Bull.stage    = ST_CISD;
-         //   MSS reference = swing high of the candle set built so far.
-         double hh = H[Bull.sweepBar];
-         for(int k = Bull.sweepBar + 1; k <= i; k++) if(H[k] > hh) hh = H[k];
-         Bull.mssLevel = hh;
-        }
-      //   Stage 6: MSS — close above that swing high -> confirmed BUY.
+        { Bull.stage = ST_CISD; Bull.mssLevel = Bull.runExtreme; }
+      //   6: MSS — close above that swing high -> confirmed BUY.
       if(Bull.stage == ST_CISD && C[i] > Bull.mssLevel)
         {
          BuyBuffer[i] = L[i] - offset;
-         DrawLevel("iFVG", T[i], i, Bull.ifvgLevel, clrDeepSkyBlue, rates_total);
-         DrawLevel("CISD", T[i], i, Bull.cisdLevel, clrGold,        rates_total);
-         DrawLevel("MSS",  T[i], i, Bull.mssLevel,  clrLime,        rates_total);
-         if(i == last_closed) RaiseAlert(true, T[i]);
+         int endIdx = MathMin(i + InpLevelExtendBars, rates_total - 1);
+         DrawSet((string)(long)T[i] + "_B", Bull, true, endIdx, poiTF);
+         if(i == last_closed) { buyFired = true; RaiseAlert(true, T[i]); }
          ResetSetup(Bull);
         }
 
       //=== (d) BEARISH reversal machine ===========================
-      if(Bear.stage != ST_IDLE && i - Bear.sweepBar > InpMaxBars)
-         ResetSetup(Bear);
+      if(Bear.stage == ST_POI   && i - Bear.poiBar   > InpMaxBars) ResetSetup(Bear);
+      if(Bear.stage >= ST_SWEPT && i - Bear.sweepBar > InpMaxBars) ResetSetup(Bear);
 
-      if(Bear.stage == ST_IDLE)
+      if(Bear.stage == ST_IDLE && havePoiHigh)
         {
-         bool sweep = (prevSwingHighBar >= 0 && prevSwingHighBar < i &&
-                       H[i] > prevSwingHigh && C[i] < prevSwingHigh);
-         bool fvgOk = (lastBullBar >= 0 && (i - lastBullBar) <= InpFVGMaxAge &&
-                       lastBullBot < H[i]);
-         if(sweep && fvgOk && InPOIZone(H[i]))
+         bool fvgOk = (lastBullBar >= 0 && (i - lastBullBar) <= InpFVGMaxAge && lastBullBot < poiHigh);
+         if(H[i] >= poiHigh - tol && fvgOk)
            {
-            Bear.stage     = ST_SWEPT;
-            Bear.sweepBar  = i;
+            Bear.stage    = ST_POI;
+            Bear.poiBar   = i;
+            Bear.poiLevel = poiHigh;
             Bear.refFVGTop = lastBullTop;
             Bear.refFVGBot = lastBullBot;
-            Bear.cisdLevel = UpLegCISD(i);
            }
         }
+      if(Bear.stage == ST_POI && H[i] > Bear.poiLevel)
+        {
+         if(C[i] < Bear.poiLevel)
+           {
+            Bear.stage      = ST_SWEPT;
+            Bear.sweepBar   = i;
+            Bear.cisdLevel  = UpLegCISD(i);
+            Bear.obLevel    = BearOB(i);
+            Bear.runExtreme = L[i];
+           }
+         else
+            ResetSetup(Bear);
+        }
+      if(Bear.stage == ST_SWEPT || Bear.stage == ST_IFVG)
+         if(L[i] < Bear.runExtreme) Bear.runExtreme = L[i];
       if(Bear.stage == ST_SWEPT && C[i] < Bear.refFVGBot)
-        {
-         Bear.stage     = ST_IFVG;
-         Bear.ifvgLevel = Bear.refFVGBot;
-        }
+        { Bear.stage = ST_IFVG; Bear.ifvgLevel = Bear.refFVGBot; }
       if(Bear.stage == ST_IFVG && C[i] < Bear.cisdLevel)
-        {
-         Bear.stage    = ST_CISD;
-         double ll = L[Bear.sweepBar];
-         for(int k = Bear.sweepBar + 1; k <= i; k++) if(L[k] < ll) ll = L[k];
-         Bear.mssLevel = ll;
-        }
+        { Bear.stage = ST_CISD; Bear.mssLevel = Bear.runExtreme; }
       if(Bear.stage == ST_CISD && C[i] < Bear.mssLevel)
         {
          SellBuffer[i] = H[i] + offset;
-         DrawLevel("iFVG", T[i], i, Bear.ifvgLevel, clrDeepSkyBlue, rates_total);
-         DrawLevel("CISD", T[i], i, Bear.cisdLevel, clrGold,        rates_total);
-         DrawLevel("MSS",  T[i], i, Bear.mssLevel,  clrRed,         rates_total);
-         if(i == last_closed) RaiseAlert(false, T[i]);
+         int endIdx = MathMin(i + InpLevelExtendBars, rates_total - 1);
+         DrawSet((string)(long)T[i] + "_S", Bear, false, endIdx, poiTF);
+         if(i == last_closed) { sellFired = true; RaiseAlert(false, T[i]); }
          ResetSetup(Bear);
         }
      }
+
+//--- Draw the live (still-forming) setups so POI/levels are visible.
+   int liveEnd = rates_total - 1;
+   if(Bull.stage >= ST_POI)
+     {
+      datetime t1 = T[liveEnd];
+      DrawTaggedLine("live_B_POI", "POI " + TFName(poiTF), T[Bull.poiBar], t1, Bull.poiLevel, clrDodgerBlue);
+      if(Bull.stage >= ST_SWEPT) DrawTaggedLine("live_B_E1", "Entry 1: CISD", T[Bull.sweepBar], t1, Bull.cisdLevel, clrGold);
+      if(Bull.stage >= ST_SWEPT) DrawTaggedLine("live_B_E3", "Entry 3: OB",   T[Bull.sweepBar], t1, Bull.obLevel,   clrMediumOrchid);
+      if(Bull.stage >= ST_IFVG)  DrawTaggedLine("live_B_E2", "Entry 2: iFVG", T[Bull.sweepBar], t1, Bull.ifvgLevel, clrDeepSkyBlue);
+      if(Bull.stage >= ST_CISD)  DrawTaggedLine("live_B_MSS","MSS (trigger)", T[Bull.sweepBar], t1, Bull.mssLevel,  clrLime);
+     }
+   if(Bear.stage >= ST_POI)
+     {
+      datetime t1 = T[liveEnd];
+      DrawTaggedLine("live_S_POI", "POI " + TFName(poiTF), T[Bear.poiBar], t1, Bear.poiLevel, clrDodgerBlue);
+      if(Bear.stage >= ST_SWEPT) DrawTaggedLine("live_S_E1", "Entry 1: CISD", T[Bear.sweepBar], t1, Bear.cisdLevel, clrGold);
+      if(Bear.stage >= ST_SWEPT) DrawTaggedLine("live_S_E3", "Entry 3: OB",   T[Bear.sweepBar], t1, Bear.obLevel,   clrMediumOrchid);
+      if(Bear.stage >= ST_IFVG)  DrawTaggedLine("live_S_E2", "Entry 2: iFVG", T[Bear.sweepBar], t1, Bear.ifvgLevel, clrDeepSkyBlue);
+      if(Bear.stage >= ST_CISD)  DrawTaggedLine("live_S_MSS","MSS (trigger)", T[Bear.sweepBar], t1, Bear.mssLevel,  clrOrangeRed);
+     }
+
+   DrawDashboard(poiTF, buyFired, sellFired);
 
 //--- Never plot on the forming bar (no-repaint).
    if(rates_total >= 1)
@@ -424,10 +613,8 @@ int OnCalculate(const int rates_total,
 //+------------------------------------------------------------------+
 void RaiseAlert(const bool is_buy, const datetime bar_time)
   {
-   static datetime last_alert = 0;
-   if(bar_time == last_alert)
-      return;
-   last_alert = bar_time;
+   if(is_buy)  { if(bar_time == LastBuyTime)  return; LastBuyTime  = bar_time; }
+   else        { if(bar_time == LastSellTime) return; LastSellTime = bar_time; }
 
    string dir = is_buy ? "BUY" : "SELL";
    string msg = StringFormat("%s %s reversal: POI sweep + iFVG + CISD + MSS confirmed",
