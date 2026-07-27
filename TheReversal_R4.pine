@@ -40,7 +40,9 @@
 //  Entries: 1 = MSS · 2 = CISD · 3 = iFVG zone.
 //  SL: safety = swept wick · aggressive = the swept swing-low level.
 // =====================================================================
-indicator("TheReversal R4", overlay = true, max_bars_back = 5000, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 200)
+// max_bars_back: deepest history reference is low[off + 2] with off <= legLook
+// (capped at 300), so 1000 is ~3x headroom. Going higher wastes memory.
+indicator("TheReversal R4", overlay = true, max_bars_back = 1000, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 200)
 
 // ------------------------- POI (manual first) ------------------------
 grpPOI = "1) POI"
@@ -216,11 +218,12 @@ var float[] plVal = array.new_float()
 var int[]   plBar = array.new_int()
 
 var float liqLow  = na
-var int   liqLowBar = na
 var float liqHigh = na
-var int   liqHighBar = na
 
-// [FIX-1] highest confirmed pivot high within `legLook` (value / bar)
+// [FIX-1] highest confirmed pivot high within `legLook` (value / bar).
+// The `if n > 0` guards below are NOT boilerplate: Pine's `for` counts
+// DOWNWARD when `to < from`, so on an empty array `for i = 1 to 0` would
+// run twice and hit array.get(x, -1) -> "index out of bounds". Keep them.
 originHighVal() =>
     float best = na
     n = array.size(phVal)
@@ -328,10 +331,8 @@ if barstate.isconfirmed and bar_index > structLen * 2 + sweepLen * 2 + legLook +
             array.shift(plBar)
     if not na(plL)
         liqLow := plL
-        liqLowBar := bar_index - sweepLen
     if not na(phL)
         liqHigh := phL
-        liqHighBar := bar_index - sweepLen
 
     // ---- [FIX-4] latch POI touches -----------------------------------
     if not na(supTop) and low <= supTop + tol and high >= supBot - tol
