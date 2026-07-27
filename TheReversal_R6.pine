@@ -1,0 +1,503 @@
+// © Indicator
+//@version=5
+// =====================================================================
+//  TheReversal_R6 — two-stage (HTF -> LTF) reversal confirmation
+// ---------------------------------------------------------------------
+//  FULL REWRITE. R0-R4 ran the sequence ONCE. The real model runs it
+//  TWICE, nested:
+//
+//   STAGE 1 (HTF, e.g. M15)
+//     Your manual POI zone -> sweep of prior swing low -> close back
+//     above the bearish FVG (iFVG) -> close above CISD -> close above
+//     the origin high (MSS).  This does NOT trade. It produces three
+//     HTF entry levels:   E1 = MSS · E2 = CISD · E3 = iFVG zone.
+//
+//   STAGE 2 (wait)
+//     Price retraces back into the HTF entry band  [E3bot ... E1].
+//
+//   STAGE 3 (LTF = chart TF, e.g. M1)
+//     That HTF entry band becomes the POI for the SAME sequence run on
+//     the chart timeframe.  When the LTF sequence completes its MSS,
+//     THAT is the trade signal (arrow + alert).
+//
+//  BIAS: a POI placed BELOW price means you are looking for longs, so
+//  only the bullish engine runs (and vice-versa). R4 ran both and could
+//  fire a SELL off a support POI with the stops upside-down.
+//
+//  Level definitions (bullish; bearish mirrored):
+//    MSS  = origin high of the leg (highest high in the lookback window)
+//    CISD = open of the first red candle after that origin high
+//    iFVG = the first bearish FVG after that origin high
+//    SL   : safety = swept wick · aggressive = the swept swing-low level
+//
+//  The origin high is now ta.highest/ta.highestbars over the lookback
+//  window instead of a pivot list, which removes R4's array machinery
+//  and its edge cases. Non-repainting: HTF via lookahead_off, and every
+//  stage advances on closed bars only.
+// =====================================================================
+//  R6 fixes (from an independent Pine audit of R5):
+//   [A] Repaint. R5 latched HTF results and fired LTF signals on the
+//       forming bar, so a signal could appear mid-bar and then vanish.
+//       Both are now gated on barstate.isconfirmed (closed bars only).
+//   [B] Stale state. The LTF engine kept `poiTouch` / `liqLow` forever,
+//       so a touch of the PREVIOUS HTF band could arm the next setup.
+//       The engine now resets itself whenever its POI changes.
+//   [C] ta.change() on a series whose identity flips with the bias, and
+//       eager-vs-short-circuit evaluation of ta.change inside `and`
+//       chains — both hoisted/hardened.
+//   [D] Cosmetics: unreachable "(bias ?)" label, unused ST_DONE.
+indicator("TheReversal R6", overlay = true, max_bars_back = 1000, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 200)
+
+// ------------------------- Inputs ------------------------------------
+grpPOI = "1) POI  (you place it)"
+htfTF   = input.timeframe("15", "HTF for stage 1", group = grpPOI)
+manTop  = input.price(0.0, "POI TOP    (drag on chart)", confirm = true, group = grpPOI)
+manBot  = input.price(0.0, "POI BOTTOM (drag on chart)", confirm = true, group = grpPOI)
+biasIn  = input.string("Auto (from POI vs price)", "Bias", options = ["Auto (from POI vs price)", "Buy only", "Sell only"], group = grpPOI)
+poiTolTicks = input.float(80, "POI touch tolerance (ticks)", minval = 0, group = grpPOI)
+poiColor    = input.color(color.new(color.orange, 82), "POI zone colour", group = grpPOI)
+
+grpEng = "2) Sequence engine (used on BOTH timeframes)"
+sweepLen  = input.int(5,  "Liquidity pivot length (sweep target)", minval = 1, maxval = 50, group = grpEng)
+legLook   = input.int(40, "Lookback for the origin high/low (bars)", minval = 4, maxval = 300, group = grpEng)
+maxBars   = input.int(60, "Max bars from sweep to MSS", minval = 1, maxval = 500, group = grpEng)
+strictSeq = input.bool(true, "One stage per bar (no same-bar cascade)", group = grpEng)
+needExtreme = input.bool(true, "Sweep must be the extreme of the leg", group = grpEng)
+
+grpLink = "3) HTF -> LTF hand-off"
+setupTTL   = input.int(300, "HTF entry levels stay valid for (chart bars)", minval = 10, maxval = 5000, group = grpLink)
+entryTolTicks = input.float(40, "Entry-level touch tolerance (ticks)", minval = 0, group = grpLink)
+
+grpDraw = "4) Drawing"
+drawZones   = input.bool(true, "Draw POI + HTF entry band + LTF iFVG", group = grpDraw)
+drawLevels  = input.bool(true, "Draw HTF E1/E2/E3 + LTF levels", group = grpDraw)
+showSL      = input.bool(true, "Draw SL lines", group = grpDraw)
+levelExtend = input.int(30, "Extend lines/zones (bars)", minval = 1, maxval = 400, group = grpDraw)
+
+grpDash = "5) Dashboard"
+showDash = input.bool(true, "Show dashboard", group = grpDash)
+dashPos  = input.string("Right", "Position", options = ["Right", "Left"], group = grpDash)
+dashSize = input.string("Normal", "Text size", options = ["Small", "Normal", "Large"], group = grpDash)
+
+// ------------------------- Constants ---------------------------------
+ST_IDLE  = 0
+ST_SWEPT = 1
+ST_IFVG  = 2
+ST_CISD  = 3
+tol   = poiTolTicks   * syminfo.mintick
+etol  = entryTolTicks * syminfo.mintick
+
+// ============ Leg scanners (pure history loops, no state) ============
+// `off` is a BACKWARD offset. The ascending loop overwrites, so the last
+// write (largest qualifying `off`) wins = the bar closest to the origin
+// high H, i.e. the FIRST candle after H.
+firstRedOpenAfter(int hAge) =>
+    float c = na
+    for off = 0 to legLook
+        if off < hAge and close[off] < open[off]
+            c := open[off]
+    c
+firstGreenOpenAfter(int hAge) =>
+    float c = na
+    for off = 0 to legLook
+        if off < hAge and close[off] > open[off]
+            c := open[off]
+    c
+// off + 2 <= hAge keeps the whole 3-candle pattern at/after the origin.
+bearFvgTopAfter(int hAge) =>
+    float t = na
+    for off = 0 to legLook
+        if off + 2 <= hAge and high[off] < low[off + 2]
+            t := low[off + 2]
+    t
+bearFvgBotAfter(int hAge) =>
+    float b = na
+    for off = 0 to legLook
+        if off + 2 <= hAge and high[off] < low[off + 2]
+            b := high[off]
+    b
+bullFvgTopAfter(int hAge) =>
+    float t = na
+    for off = 0 to legLook
+        if off + 2 <= hAge and low[off] > high[off + 2]
+            t := low[off]
+    t
+bullFvgBotAfter(int hAge) =>
+    float b = na
+    for off = 0 to legLook
+        if off + 2 <= hAge and low[off] > high[off + 2]
+            b := high[off + 2]
+    b
+
+// ===================== THE SHARED ENGINE =============================
+// One full POI -> sweep -> iFVG -> CISD -> MSS run. Used twice: once in
+// the HTF security context, once on the chart TF. Each call site keeps
+// its own `var` state, so the two runs never interfere.
+// Returns: cnt (increments on each completed run), stage, and the frozen
+// levels of the most recent completed run.
+bullEngine(float poiTop, float poiBot) =>
+    var int   stage = ST_IDLE
+    var int   stageBar = na
+    var int   sweepBar = na
+    var int   poiTouch = na
+    var float liqLow = na
+    var float sMss = na
+    var float sCisd = na
+    var float sFt = na
+    var float sFb = na
+    var float sSweepLow = na
+    var float sLiq = na
+    var int   cnt = 0
+    var float oMss = na
+    var float oCisd = na
+    var float oFt = na
+    var float oFb = na
+    var float oSlS = na
+    var float oSlA = na
+
+    // ta.* must run every bar, never inside an if, or their state breaks
+    pl   = ta.pivotlow(low, sweepLen, sweepLen)
+    oh   = ta.highest(high, legLook)
+    hAge = -ta.highestbars(high, legLook)
+    legLowOk = low <= ta.lowest(low, legLook)
+    // nz(...,-1) so na<->value transitions are detected too (prices are > 0);
+    // ta.change(na) would be na and would silently skip the reset.
+    poiChanged = ta.change(nz(poiTop, -1.0))
+
+    // [FIX-B] a new POI (e.g. the next HTF band) must not inherit the
+    // previous setup's touch latch or half-finished stage.
+    if poiChanged != 0
+        poiTouch := na
+        stage := ST_IDLE
+
+    if not na(pl)
+        liqLow := pl
+    if not na(poiTop) and low <= poiTop + tol and high >= poiBot - tol
+        poiTouch := bar_index
+
+    // invalidation before anything else
+    if stage != ST_IDLE and low < sSweepLow
+        stage := ST_IDLE
+    if stage >= ST_IFVG and close < sFb
+        stage := ST_IDLE
+    if stage != ST_IDLE and bar_index - sweepBar > maxBars
+        stage := ST_IDLE
+
+    if stage == ST_IDLE and not na(liqLow) and not na(poiTouch) and not na(poiTop)
+        inPOI = bar_index - poiTouch <= legLook
+        swept = low < liqLow and close > liqLow
+        if inPOI and swept and hAge >= 3 and (not needExtreme or legLowOk)
+            cisd = firstRedOpenAfter(hAge)
+            ft   = bearFvgTopAfter(hAge)
+            fb   = bearFvgBotAfter(hAge)
+            if not na(cisd) and not na(ft) and not na(fb) and oh >= cisd and cisd >= ft and ft > low and close < ft
+                stage := ST_SWEPT
+                stageBar := bar_index
+                sweepBar := bar_index
+                sMss := oh
+                sCisd := cisd
+                sFt := ft
+                sFb := fb
+                sSweepLow := low
+                sLiq := liqLow
+    if stage == ST_SWEPT and (not strictSeq or bar_index > stageBar) and close > sFt
+        stage := ST_IFVG
+        stageBar := bar_index
+    if stage == ST_IFVG and (not strictSeq or bar_index > stageBar) and close > sCisd
+        stage := ST_CISD
+        stageBar := bar_index
+    if stage == ST_CISD and (not strictSeq or bar_index > stageBar) and close > sMss
+        cnt := cnt + 1
+        oMss := sMss
+        oCisd := sCisd
+        oFt := sFt
+        oFb := sFb
+        oSlS := sSweepLow
+        oSlA := nz(sLiq, sSweepLow)
+        stage := ST_IDLE
+    [cnt, stage, oMss, oCisd, oFt, oFb, oSlS, oSlA]
+
+bearEngine(float poiTop, float poiBot) =>
+    var int   stage = ST_IDLE
+    var int   stageBar = na
+    var int   sweepBar = na
+    var int   poiTouch = na
+    var float liqHigh = na
+    var float sMss = na
+    var float sCisd = na
+    var float sFt = na
+    var float sFb = na
+    var float sSweepHigh = na
+    var float sLiq = na
+    var int   cnt = 0
+    var float oMss = na
+    var float oCisd = na
+    var float oFt = na
+    var float oFb = na
+    var float oSlS = na
+    var float oSlA = na
+
+    ph   = ta.pivothigh(high, sweepLen, sweepLen)
+    ol   = ta.lowest(low, legLook)
+    lAge = -ta.lowestbars(low, legLook)
+    legHighOk = high >= ta.highest(high, legLook)
+    // nz(...,-1) so na<->value transitions are detected too (prices are > 0);
+    // ta.change(na) would be na and would silently skip the reset.
+    poiChanged = ta.change(nz(poiTop, -1.0))
+
+    // [FIX-B] see bullEngine
+    if poiChanged != 0
+        poiTouch := na
+        stage := ST_IDLE
+
+    if not na(ph)
+        liqHigh := ph
+    if not na(poiTop) and high >= poiBot - tol and low <= poiTop + tol
+        poiTouch := bar_index
+
+    if stage != ST_IDLE and high > sSweepHigh
+        stage := ST_IDLE
+    if stage >= ST_IFVG and close > sFt
+        stage := ST_IDLE
+    if stage != ST_IDLE and bar_index - sweepBar > maxBars
+        stage := ST_IDLE
+
+    if stage == ST_IDLE and not na(liqHigh) and not na(poiTouch) and not na(poiTop)
+        inPOI = bar_index - poiTouch <= legLook
+        swept = high > liqHigh and close < liqHigh
+        if inPOI and swept and lAge >= 3 and (not needExtreme or legHighOk)
+            cisd = firstGreenOpenAfter(lAge)
+            ft   = bullFvgTopAfter(lAge)
+            fb   = bullFvgBotAfter(lAge)
+            if not na(cisd) and not na(ft) and not na(fb) and ol <= cisd and cisd <= fb and fb < high and close > fb
+                stage := ST_SWEPT
+                stageBar := bar_index
+                sweepBar := bar_index
+                sMss := ol
+                sCisd := cisd
+                sFt := ft
+                sFb := fb
+                sSweepHigh := high
+                sLiq := liqHigh
+    if stage == ST_SWEPT and (not strictSeq or bar_index > stageBar) and close < sFb
+        stage := ST_IFVG
+        stageBar := bar_index
+    if stage == ST_IFVG and (not strictSeq or bar_index > stageBar) and close < sCisd
+        stage := ST_CISD
+        stageBar := bar_index
+    if stage == ST_CISD and (not strictSeq or bar_index > stageBar) and close < sMss
+        cnt := cnt + 1
+        oMss := sMss
+        oCisd := sCisd
+        oFt := sFt
+        oFb := sFb
+        oSlS := sSweepHigh
+        oSlA := nz(sLiq, sSweepHigh)
+        stage := ST_IDLE
+    [cnt, stage, oMss, oCisd, oFt, oFb, oSlS, oSlA]
+
+// ===================== BIAS from POI placement =======================
+manValid = manTop > 0 and manBot > 0 and manTop > manBot
+var int biasLatch = 0
+if biasLatch == 0 and manValid and barstate.isconfirmed
+    biasLatch := close > manTop ? 1 : close < manBot ? -1 : 0
+isBull = biasIn == "Buy only" ? true : biasIn == "Sell only" ? false : biasLatch >= 0
+isBear = biasIn == "Sell only" ? true : biasIn == "Buy only" ? false : biasLatch < 0
+// Auto with the latch still 0 (price started inside the POI) runs neither.
+biasKnown = biasIn != "Auto (from POI vs price)" or biasLatch != 0
+
+// ===================== STAGE 1 — HTF sequence ========================
+htfPoiTop = manValid ? manTop : na
+htfPoiBot = manValid ? manBot : na
+
+[hbCnt, hbStage, hbMss, hbCisd, hbFt, hbFb, hbSlS, hbSlA] = request.security(syminfo.tickerid, htfTF, bullEngine(htfPoiTop, htfPoiBot), lookahead = barmerge.lookahead_off)
+[hsCnt, hsStage, hsMss, hsCisd, hsFt, hsFb, hsSlS, hsSlA] = request.security(syminfo.tickerid, htfTF, bearEngine(htfPoiTop, htfPoiBot), lookahead = barmerge.lookahead_off)
+
+// Pick the side the bias allows
+// [FIX-C] resolve to 0 until the bias is known, so ta.change() never sees
+// the counter identity flip from the bull series to the bear series.
+htfCnt   = isBull ? hbCnt : isBear ? hsCnt : 0
+htfStage = isBull ? hbStage : hsStage
+htfMss   = isBull ? hbMss   : hsMss
+htfCisd  = isBull ? hbCisd  : hsCisd
+htfFt    = isBull ? hbFt    : hsFt
+htfFb    = isBull ? hbFb    : hsFb
+
+// ===================== STAGE 2 — hand-off ============================
+// A completed HTF run publishes E1/E2/E3. They stay valid for setupTTL
+// chart bars. The entry band is E1..E3bot (bull) / E3top..E1 (bear).
+var int   htfBar = na
+var float e1 = na
+var float e2 = na
+var float e3t = na
+var float e3b = na
+var int   htfDir = 0
+
+// [FIX-A] / [FIX-C] hoist ta.change so it runs every bar regardless of the
+// guards (v5 is eager, v6 short-circuits), and only latch on a CLOSED bar
+// so a mid-bar HTF completion cannot appear and then vanish.
+htfChg = ta.change(htfCnt)
+if barstate.isconfirmed and biasKnown and htfChg != 0 and not na(htfMss)
+    htfBar := bar_index
+    e1  := htfMss
+    e2  := htfCisd
+    e3t := htfFt
+    e3b := htfFb
+    htfDir := isBull ? 1 : -1
+
+htfLive = not na(htfBar) and bar_index - htfBar <= setupTTL and htfDir != 0
+
+// Entry band -> the POI handed to the LTF engine.
+// Bull: E1(MSS) on top, E3(iFVG) below. Bear: mirrored. max/min covers both.
+bandTop = htfLive ? math.max(e1, e3t) : na
+bandBot = htfLive ? math.min(e1, e3b) : na
+
+// which entry level is price actually in right now (for the dashboard)
+inE1 = htfLive and math.abs(close - e1) <= etol
+inE2 = htfLive and math.abs(close - e2) <= etol
+inE3 = htfLive and not na(e3t) and low <= e3t + etol and high >= e3b - etol
+entryHit = inE3 ? 3 : inE2 ? 2 : inE1 ? 1 : 0
+
+// ===================== STAGE 3 — LTF sequence ========================
+[lbCnt, lbStage, lbMss, lbCisd, lbFt, lbFb, lbSlS, lbSlA] = bullEngine(htfDir ==  1 ? bandTop : na, htfDir ==  1 ? bandBot : na)
+[lsCnt, lsStage, lsMss, lsCisd, lsFt, lsFb, lsSlS, lsSlA] = bearEngine(htfDir == -1 ? bandTop : na, htfDir == -1 ? bandBot : na)
+
+ltfStage = htfDir == 1 ? lbStage : htfDir == -1 ? lsStage : ST_IDLE
+// [FIX-A] hoisted + closed-bar gated: a signal is published only once the
+// bar that completed the LTF sequence has actually closed, so an arrow can
+// never print intrabar and then disappear.
+lbChg = ta.change(lbCnt)
+lsChg = ta.change(lsCnt)
+buySignal  = barstate.isconfirmed and htfLive and htfDir ==  1 and lbChg != 0
+sellSignal = barstate.isconfirmed and htfLive and htfDir == -1 and lsChg != 0
+
+// frozen levels of the fired LTF setup
+var int   lastDir = 0
+var int   lastSigBar = na
+var int   lastSigTime = na
+var float sMssL = na
+var float sCisdL = na
+var float sFtL = na
+var float sFbL = na
+var float sSlS = na
+var float sSlA = na
+if buySignal or sellSignal
+    lastDir := buySignal ? 1 : -1
+    lastSigBar := bar_index
+    lastSigTime := time
+    sMssL  := buySignal ? lbMss  : lsMss
+    sCisdL := buySignal ? lbCisd : lsCisd
+    sFtL   := buySignal ? lbFt   : lsFt
+    sFbL   := buySignal ? lbFb   : lsFb
+    sSlS   := buySignal ? lbSlS  : lsSlS
+    sSlA   := buySignal ? lbSlA  : lsSlA
+
+// ========================= DRAWING ===================================
+f_size() => dashSize == "Small" ? size.small : dashSize == "Large" ? size.large : size.normal
+
+if buySignal or sellSignal
+    xr = bar_index + levelExtend
+    if drawLevels
+        line.new(bar_index, sMssL,  xr, sMssL,  color = color.new(color.blue, 0),   width = 2)
+        line.new(bar_index, sCisdL, xr, sCisdL, color = color.new(color.purple, 0), width = 2)
+        label.new(xr, sMssL,  " LTF MSS",  style = label.style_none, textcolor = color.blue,   size = size.small)
+        label.new(xr, sCisdL, " LTF CISD", style = label.style_none, textcolor = color.purple, size = size.small)
+    if drawZones and not na(sFtL)
+        box.new(bar_index, sFtL, xr, sFbL, border_color = color.new(color.aqua, 40), bgcolor = color.new(color.aqua, 82))
+    if showSL
+        line.new(bar_index, sSlS, xr, sSlS, color = color.new(color.red, 10),    style = line.style_dashed)
+        line.new(bar_index, sSlA, xr, sSlA, color = color.new(color.orange, 10), style = line.style_dotted)
+        label.new(xr, sSlS, " SL safety", style = label.style_none, textcolor = color.red,    size = size.small)
+        label.new(xr, sSlA, " SL aggr.",  style = label.style_none, textcolor = color.orange, size = size.small)
+
+var box poiBox = na
+var box bandBox = na
+var line[]  liveLn = array.new_line()
+var label[] liveLb = array.new_label()
+pushLive(int x1, float p, string txt, color c, string st) =>
+    xr = bar_index + levelExtend
+    ls = st == "solid" ? line.style_solid : st == "dashed" ? line.style_dashed : line.style_dotted
+    array.push(liveLn, line.new(x1, p, xr, p, color = c, style = ls))
+    array.push(liveLb, label.new(xr, p, txt, style = label.style_none, textcolor = c, size = size.small))
+
+if barstate.islast
+    if not na(poiBox)
+        box.delete(poiBox)
+    if not na(bandBox)
+        box.delete(bandBox)
+    xl = math.max(0, bar_index - 100)
+    if drawZones and manValid
+        poiBox := box.new(xl, manTop, bar_index + levelExtend, manBot, border_color = color.new(color.orange, 40), bgcolor = poiColor, text = "POI " + htfTF + (not biasKnown ? "  (bias ?)" : isBull ? "  (bias BUY)" : "  (bias SELL)"), text_color = color.new(color.orange, 0), text_halign = text.align_left, text_size = size.small)
+    if drawZones and htfLive and not na(bandTop)
+        bandBox := box.new(math.max(0, nz(htfBar, bar_index)), bandTop, bar_index + levelExtend, bandBot, border_color = color.new(color.blue, 50), bgcolor = color.new(color.blue, 90), text = "HTF entry band", text_color = color.new(color.blue, 0), text_halign = text.align_right, text_size = size.small)
+    while array.size(liveLn) > 0
+        line.delete(array.pop(liveLn))
+    while array.size(liveLb) > 0
+        label.delete(array.pop(liveLb))
+    if drawLevels and htfLive
+        x0 = math.max(0, nz(htfBar, bar_index))
+        pushLive(x0, e1,  " HTF E1 · MSS",  color.blue,   "solid")
+        pushLive(x0, e2,  " HTF E2 · CISD", color.purple, "dotted")
+        pushLive(x0, e3t, " HTF E3 · iFVG top", color.teal, "dotted")
+        pushLive(x0, e3b, " HTF E3 · iFVG bot", color.teal, "dotted")
+
+plotshape(buySignal,  title = "Buy",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.lime, 0), size = size.normal, text = "BUY")
+plotshape(sellSignal, title = "Sell", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0),  size = size.normal, text = "SELL")
+
+// ========================= DASHBOARD =================================
+dot(bool on)  => on ? "●" : "○"
+dcol(bool on) => on ? color.new(#26a69a, 0) : color.new(color.gray, 45)
+stTxt(int st) => st == ST_SWEPT ? "swept" : st == ST_IFVG ? "iFVG" : st == ST_CISD ? "await MSS" : "idle"
+
+var table dash = na
+if showDash and barstate.islast
+    ts  = f_size()
+    pos = dashPos == "Left" ? position.top_left : position.top_right
+    tk  = format.mintick
+    dirTxt = not biasKnown ? "? (price inside POI)" : isBull ? "BUY ▲" : "SELL ▼"
+    dirCol = not biasKnown ? color.gray : isBull ? color.lime : color.red
+
+    if na(dash)
+        dash := table.new(pos, 2, 16, border_width = 1, frame_color = color.new(color.gray, 40), frame_width = 1)
+    table.clear(dash, 0, 0, 1, 15)
+    table.cell(dash, 0, 0, "🎯 TheReversal R6", text_color = color.white, text_size = ts, bgcolor = color.new(#1f2937, 0))
+    table.cell(dash, 1, 0, dirTxt, text_color = dirCol, text_size = ts, bgcolor = color.new(#1f2937, 0))
+
+    table.cell(dash, 0, 1, "── STAGE 1 · HTF " + htfTF + " ──", text_color = color.new(color.gray, 0), text_size = ts, bgcolor = color.new(#1f2937, 30))
+    table.cell(dash, 1, 1, "", bgcolor = color.new(#1f2937, 30))
+    table.cell(dash, 0, 2, "POI placed", text_color = color.silver, text_size = ts)
+    table.cell(dash, 1, 2, dot(manValid), text_color = dcol(manValid), text_size = ts)
+    table.cell(dash, 0, 3, "HTF sequence", text_color = color.silver, text_size = ts)
+    table.cell(dash, 1, 3, htfLive ? "COMPLETE ✔" : stTxt(htfStage), text_color = htfLive ? color.new(#26a69a, 0) : color.silver, text_size = ts)
+
+    table.cell(dash, 0, 4, "── STAGE 2 · entry levels ──", text_color = color.new(color.gray, 0), text_size = ts, bgcolor = color.new(#1f2937, 30))
+    table.cell(dash, 1, 4, htfLive ? "armed" : "-", text_color = color.silver, text_size = ts, bgcolor = color.new(#1f2937, 30))
+    table.cell(dash, 0, 5, "E1 · MSS", text_color = color.new(color.blue, 0), text_size = ts)
+    table.cell(dash, 1, 5, htfLive ? str.tostring(e1, tk) + (entryHit == 1 ? "  ◀" : "") : "-", text_color = entryHit == 1 ? color.yellow : color.silver, text_size = ts)
+    table.cell(dash, 0, 6, "E2 · CISD", text_color = color.new(color.purple, 0), text_size = ts)
+    table.cell(dash, 1, 6, htfLive ? str.tostring(e2, tk) + (entryHit == 2 ? "  ◀" : "") : "-", text_color = entryHit == 2 ? color.yellow : color.silver, text_size = ts)
+    table.cell(dash, 0, 7, "E3 · iFVG", text_color = color.new(color.teal, 0), text_size = ts)
+    table.cell(dash, 1, 7, htfLive ? str.tostring(e3t, tk) + "–" + str.tostring(e3b, tk) + (entryHit == 3 ? "  ◀" : "") : "-", text_color = entryHit == 3 ? color.yellow : color.silver, text_size = ts)
+    table.cell(dash, 0, 8, "price in entry", text_color = color.silver, text_size = ts)
+    table.cell(dash, 1, 8, entryHit > 0 ? "E" + str.tostring(entryHit) : "-", text_color = entryHit > 0 ? color.yellow : color.silver, text_size = ts)
+
+    table.cell(dash, 0, 9, "── STAGE 3 · LTF " + timeframe.period + " ──", text_color = color.new(color.gray, 0), text_size = ts, bgcolor = color.new(#1f2937, 30))
+    table.cell(dash, 1, 9, htfLive ? stTxt(ltfStage) : "-", text_color = color.silver, text_size = ts, bgcolor = color.new(#1f2937, 30))
+    table.cell(dash, 0, 10, "Liquidity Sweep", text_color = color.silver, text_size = ts)
+    table.cell(dash, 1, 10, dot(ltfStage >= ST_SWEPT), text_color = dcol(ltfStage >= ST_SWEPT), text_size = ts)
+    table.cell(dash, 0, 11, "iFVG", text_color = color.silver, text_size = ts)
+    table.cell(dash, 1, 11, dot(ltfStage >= ST_IFVG), text_color = dcol(ltfStage >= ST_IFVG), text_size = ts)
+    table.cell(dash, 0, 12, "CISD", text_color = color.silver, text_size = ts)
+    table.cell(dash, 1, 12, dot(ltfStage >= ST_CISD), text_color = dcol(ltfStage >= ST_CISD), text_size = ts)
+
+    haveSig = not na(lastSigBar)
+    table.cell(dash, 0, 13, "── SIGNAL ──", text_color = color.new(color.gray, 0), text_size = ts, bgcolor = color.new(#1f2937, 30))
+    table.cell(dash, 1, 13, haveSig ? (lastDir == 1 ? "BUY ▲ " : "SELL ▼ ") + str.format_time(lastSigTime, "HH:mm", syminfo.timezone) : "-", text_color = not haveSig ? color.gray : lastDir == 1 ? color.lime : color.red, text_size = ts, bgcolor = color.new(#1f2937, 30))
+    table.cell(dash, 0, 14, "SL safety", text_color = color.new(color.red, 0), text_size = ts)
+    table.cell(dash, 1, 14, haveSig ? str.tostring(sSlS, tk) : "-", text_color = color.silver, text_size = ts)
+    table.cell(dash, 0, 15, "SL aggressive", text_color = color.new(color.orange, 0), text_size = ts)
+    table.cell(dash, 1, 15, haveSig ? str.tostring(sSlA, tk) : "-", text_color = color.silver, text_size = ts)
+
+// ------------------------- Alerts ------------------------------------
+alertcondition(buySignal,  "TheReversal R6 Buy",  "BUY: HTF sequence + retrace to entry + LTF sequence confirmed")
+alertcondition(sellSignal, "TheReversal R6 Sell", "SELL: HTF sequence + retrace to entry + LTF sequence confirmed")
